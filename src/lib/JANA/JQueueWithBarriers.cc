@@ -39,26 +39,36 @@
 
 #include <iostream>
 #include "JQueueWithBarriers.h"
-#include "JLog.h"
+#include "JLogger.h"
 #include "JThread.h"
 #include "JEvent.h"
 
 //---------------------------------
 // JQueueWithBarriers    (Constructor)
 //---------------------------------
-JQueueWithBarriers::JQueueWithBarriers(const std::string& aName, std::size_t aQueueSize, std::size_t aTaskBufferSize) :
-	JQueueInterface(aName), mTaskBufferSize(aTaskBufferSize), mInputQueue(new JQueueWithLock(aName + " Input", aQueueSize, aTaskBufferSize)),
-	mOutputQueue(new JQueueWithLock(aName + " Output", aQueueSize, aTaskBufferSize))
-{
-	//Apparently segfaults
-	//gPARMS->SetDefaultParameter("JANA:QUEUE_DEBUG_LEVEL", mDebugLevel, "JQueue debug level");
+JQueueWithBarriers::JQueueWithBarriers(JParameterManager* aParams, 
+		                       const std::string& aName, 
+				       std::size_t aQueueSize, 
+				       std::size_t aTaskBufferSize)
+  : JQueue(aName), 
+    mTaskBufferSize(aTaskBufferSize), 
+    mInputQueue(new JQueueWithLock(aParams, aName + " Input", 
+			           aQueueSize, aTaskBufferSize)),
+    mOutputQueue(new JQueueWithLock(aParams, aName + " Output", 
+			            aQueueSize, aTaskBufferSize)) {
+
+
+	aParams->SetDefaultParameter("JANA:QUEUE_DEBUG_LEVEL", 
+			            mDebugLevel, 
+				    "JQueue debug level");
+
 	mThread = new std::thread(&JQueueWithBarriers::ThreadLoop, this);
 }
 
 //---------------------------------
 // JQueueWithBarriers    (Copy Constructor)
 //---------------------------------
-JQueueWithBarriers::JQueueWithBarriers(const JQueueWithBarriers& aQueue) : JQueueInterface(aQueue)
+JQueueWithBarriers::JQueueWithBarriers(const JQueueWithBarriers& aQueue) : JQueue(aQueue)
 {
 	//Assume this is called by CloneEmpty() or similar on an empty queue (ugh, can improve later)
 	mTaskBufferSize = aQueue.mTaskBufferSize;
@@ -76,7 +86,7 @@ JQueueWithBarriers::JQueueWithBarriers(const JQueueWithBarriers& aQueue) : JQueu
 JQueueWithBarriers& JQueueWithBarriers::operator=(const JQueueWithBarriers& aQueue)
 {
 	//Assume this is called by Clone() or similar on an empty queue (ugh, can improve later)
-	JQueueInterface::operator=(aQueue);
+	JQueue::operator=(aQueue);
 	mTaskBufferSize = aQueue.mTaskBufferSize;
 	return *this;
 }
@@ -89,12 +99,14 @@ JQueueWithBarriers::~JQueueWithBarriers(void)
 	mEndThread = true;
 	mThread->join();
 	delete mThread;
+	delete mInputQueue;
+	delete mOutputQueue;
 }
 
 //---------------------------------
 // AddTask
 //---------------------------------
-JQueueInterface::Flags_t JQueueWithBarriers::AddTask(const std::shared_ptr<JTaskBase>& aTask)
+JQueue::Flags_t JQueueWithBarriers::AddTask(const std::shared_ptr<JTaskBase>& aTask)
 {
 	return mInputQueue->AddTask(aTask);
 }
@@ -102,7 +114,7 @@ JQueueInterface::Flags_t JQueueWithBarriers::AddTask(const std::shared_ptr<JTask
 //---------------------------------
 // AddTask
 //---------------------------------
-JQueueInterface::Flags_t JQueueWithBarriers::AddTask(std::shared_ptr<JTaskBase>&& aTask)
+JQueue::Flags_t JQueueWithBarriers::AddTask(std::shared_ptr<JTaskBase>&& aTask)
 {
 	return mInputQueue->AddTask(std::move(aTask));
 }
@@ -173,7 +185,15 @@ void JQueueWithBarriers::ThreadLoop(void)
 				sEvent->SetLatestBarrierEvent(mLatestBarrierEvent);
 
 			//Move task to output queue
-			mOutputQueue->AddTask(std::move(sTask));
+			while( mOutputQueue->AddTask( std::move(sTask) ) == JQueue::Flags_t::kQUEUE_FULL ){
+				// Crap, the queue is full. Try pulling a task off and running it here.
+				// Then we can try adding our task again.
+				auto sEventTask = mOutputQueue->GetTask();
+				if( sEventTask != nullptr ){
+					(*sEventTask)();
+					mOutputQueue->AddTasksProcessedOutsideQueue(1);
+				}
+			}
 
 			//If barrier, Don't move any more tasks to the output queue until the barrier event is finished being analyzed.
 			if(sIsBarrierEvent)
@@ -192,7 +212,7 @@ void JQueueWithBarriers::ThreadLoop(void)
 }
 
 //---------------------------------
-// GetEvent
+// GetTask
 //---------------------------------
 std::shared_ptr<JTaskBase> JQueueWithBarriers::GetTask(void)
 {
@@ -216,6 +236,7 @@ uint64_t JQueueWithBarriers::GetNumTasksProcessed(void)
 	/// Returns number of events that have been taken out of this
 	/// queue. Does not include events still in the queue (see
 	/// GetNumTasks for that).
+//	return mInputQueue->GetNumTasksProcessed();
 	return mOutputQueue->GetNumTasksProcessed();
 }
 
@@ -240,7 +261,7 @@ std::size_t JQueueWithBarriers::GetTaskBufferSize(void)
 //---------------------------------
 // Clone
 //---------------------------------
-JQueueInterface* JQueueWithBarriers::CloneEmpty(void) const
+JQueue* JQueueWithBarriers::CloneEmpty(void) const
 {
 	//Create an empty clone of the queue (no tasks copied)
 	return (new JQueueWithBarriers(*this));

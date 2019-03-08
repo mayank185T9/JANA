@@ -25,8 +25,29 @@
 *.la
 *.a
 *.lib
+*.pyc
 
 # Executables
 *.exe
 *.out
 *.app
+
+# Build system generated files
+.externalToolBuilders
+.project
+.pydevproject
+.cproject
+.settings
+.sconsign.dblite
+SBMS
+Linux_*
+Darwin_*
+.Linux_*
+.Darwin_*
+
+# Doxygen generated files
+#docs/html/*
+docs/latex/*
+
+# Vim swap files
+*.swp

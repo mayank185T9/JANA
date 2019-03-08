@@ -49,13 +49,17 @@
 #include <mutex>
 #include <deque>
 
-#include "JQueueInterface.h"
+#include "JQueue.h"
+#include "JParameterManager.h"
 
-class JQueueWithLock : public JQueueInterface
+class JQueueWithLock : public JQueue
 {
 	public:
 	
-		JQueueWithLock(const std::string& aName, std::size_t aQueueSize = 200, std::size_t aTaskBufferSize = 0);
+		JQueueWithLock(JParameterManager* aParams, 
+			       const std::string& aName, 
+			       std::size_t aQueueSize = 200, 
+			       std::size_t aTaskBufferSize = 0);
 
 		//COPIERS //needed because atomic not copyable
 		JQueueWithLock(const JQueueWithLock& aQueue);
@@ -72,13 +76,15 @@ class JQueueWithLock : public JQueueInterface
 
 		uint32_t GetMaxTasks(void);
 		uint32_t GetNumTasks(void);
+		uint32_t GetNumTasksWithLock(void);
 		uint64_t GetNumTasksProcessed(void);
 		std::size_t GetTaskBufferSize(void);
 	
-		JQueueInterface* CloneEmpty(void) const;
+		JQueue* CloneEmpty(void) const;
 
 	private:
 
+		std::size_t mQueueSize = 0;
 		std::size_t mTaskBufferSize = 0; //min event task buffer (only checked for Events queue) //will get more events if # tasks < this
 		int mDebugLevel = 0;
 		uint32_t mLogTarget = 0; //cout

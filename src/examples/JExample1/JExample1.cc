@@ -9,18 +9,19 @@
 #include <utility>
 
 #include <JANA/JApplication.h>
-#include <JANA/JEventSourceGenerator.h>
-#include <JANA/JEventSource.h>
-#include <JANA/JEventSourceManager.h>
-#include <JANA/JQueue.h>
+#include <JANA/JEventSourceGeneratorT.h>
+//#include <JANA/JEventSource.h>
+//#include <JANA/JEventSourceManager.h>
+//#include <JANA/JQueue.h>
 #include <JANA/JEvent.h>
-#include <JANA/JEventSource.h>
+//#include <JANA/JEventSourceT.h>
+
 
 //-------------------------------------------------------------------------
-// This class represents a single, complete "event" read from the source
+// This class represents a single, complete "event" read from the source.
+// The only requirement here is that it inherit from JEvent.
 class JEvent_example1:public JEvent {
 	public:	
-		JEvent_example1(double a, int b): JEvent(japp), A(a),B(b){}
 
 		double A;
 		int B;		
@@ -29,39 +30,36 @@ class JEvent_example1:public JEvent {
 
 //-------------------------------------------------------------------------
 // This class would be responsible for opening and reading from the source
-// of events (e.g. a file or network socket). It should read one or more
-// events every time the GetEvent() method is called. The actual data read
-// should be encapsulated in a JEvent object and placed in the appropriate
-// JQueue.
+// of events (e.g. a file or network socket). It should read an event every
+// time the GetEvent() method is called. The actual data read should be
+// encapsulated in the form of a JEvent object.
 class JEventSource_example1: public JEventSource{
 	public:
-		JEventSource_example1(const char* source_name):JEventSource(source_name, japp){}
+	
+		// Constructor must take string and JApplication pointer as arguments
+		// and pass them into JEventSource constructor.
+		JEventSource_example1(std::string source_name, JApplication *app):JEventSource(source_name, app){}
+	
+		// A description of this source type must be provided as a static member
+		static std::string GetDescription(void){ return "Event source for JExample1"; }
 
-		std::type_index GetDerivedType(void) const {return std::type_index(typeid(JEventSource_example1));}; //So that we only execute factory generator once per type
+		// This method is called to read in a single "event"
+		std::shared_ptr<const JEvent> GetEvent(void){
+		
+			// Throw exception if we have exhausted the source of events.
+			static size_t Nevents = 0; // by way of example, just count 1000000 events
+			if( ++Nevents > 1000000 ) throw JEventSource::RETURN_STATUS::kNO_MORE_EVENTS;
+			
+			// Create a JEvent object and fill in important info
+			auto jevent = new JEvent_example1();
+			jevent->A = 1.0;
+			jevent->B = 2;
 
-		std::pair<std::shared_ptr<const JEvent>, RETURN_STATUS> GetEvent(void){
-			return std::make_pair(std::make_shared<const JEvent_example1>(1.0, 2), JEventSource::RETURN_STATUS::kSUCCESS);
+			// Return the JEvent as a shared_ptr
+			return std::shared_ptr<const JEvent>(jevent);
 		}
 };
 
-//-------------------------------------------------------------------------
-// This class is used to allow JANA to intelligently select which type
-// of JEventSource object to make in order to read from a given source
-// specified by the user. The value returned by CheckOpenable() should
-// be between 0-1 with larger values indicating greater confidence that
-// its JEventSource class can read from that source. For this simple 
-// example, 0.5 is always returned and since it is the only JEventSourceGenerator
-// registered, it will always be chosen.
-class JEventSourceGenerator_example1: public JEventSourceGenerator{
-	public:
-		JEventSourceGenerator_example1():JEventSourceGenerator("example1"){}
-		
-		const char* Description(void){ return "example1"; }
-
-		double CheckOpenable(string source){ return 0.5; }
-
-		JEventSource* MakeJEventSource(string source){ return new JEventSource_example1(source.c_str()); }
-};
 //-------------------------------------------------------------------------
 // This little piece of code is executed when the plugin is attached.
 // It should always call "InitJANAPlugin(app)" first, and then register
@@ -70,8 +68,8 @@ class JEventSourceGenerator_example1: public JEventSourceGenerator{
 extern "C"{
 void InitPlugin(JApplication *app){
 	InitJANAPlugin(app);
-	app->GetJEventSourceManager()->AddJEventSourceGenerator(new JEventSourceGenerator_example1());
+	
+	app->Add( new JEventSourceGeneratorT<JEventSource_example1>() );
 }
 } // "C"
-
 

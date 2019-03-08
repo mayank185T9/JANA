@@ -38,19 +38,15 @@
 //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
 #include "JParameterManager.h"
-#include "JLog.h"
+#include "JLogger.h"
 
 using namespace std;
 
-JParameterManager *gPARMS = nullptr;
 
 //---------------------------------
 // JParameterManager    (Constructor)
 //---------------------------------
-JParameterManager::JParameterManager()
-{
-	gPARMS = this;
-}
+JParameterManager::JParameterManager() { }
 
 //---------------------------------
 // ~JParameterManager    (Destructor)
@@ -66,7 +62,7 @@ JParameterManager::~JParameterManager()
 //---------------------------------
 bool JParameterManager::Exists(string name)
 {
-	return _jparameters.count(name) != 0;
+	return _jparameters.count( ToLC(name) ) != 0;
 }
 
 //---------------------------------
@@ -76,7 +72,7 @@ JParameter* JParameterManager::FindParameter(std::string name)
 {	
 	if( ! Exists(name) ) return nullptr;
 
-	return _jparameters[name];
+	return _jparameters[ ToLC(name) ];
 }		
 
 //---------------------------------
@@ -121,8 +117,9 @@ void JParameterManager::PrintParameters(bool all)
 
 	// Print all parameters
 	for(string &key : keys){
+		auto name  = _jparameters[key]->GetName();
 		string val = _jparameters[key]->GetValue<string>();
-		JLog() << string(max_key_len+2-key.length(),' ') << key << " = " << val << "\n" << JLogEnd();
+		JLog() << string(max_key_len+2-key.length(),' ') << name << " = " << val << "\n" << JLogEnd();
 	}
 	JLog() << "\n" << JLogEnd();
 }

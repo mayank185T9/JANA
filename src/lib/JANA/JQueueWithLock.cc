@@ -39,25 +39,32 @@
 
 #include <iostream>
 #include "JQueueWithLock.h"
-#include "JLog.h"
+#include "JLogger.h"
 #include "JThread.h"
 
 //---------------------------------
 // JQueueWithLock    (Constructor)
 //---------------------------------
-JQueueWithLock::JQueueWithLock(const std::string& aName, std::size_t aQueueSize, std::size_t aTaskBufferSize) : JQueueInterface(aName), mTaskBufferSize(aTaskBufferSize)
-{
-	//Apparently segfaults
-//	gPARMS->SetDefaultParameter("JANA:QUEUE_DEBUG_LEVEL", mDebugLevel, "JQueueWithLock debug level");
+JQueueWithLock::JQueueWithLock(JParameterManager* aParams, 
+		               const std::string& aName, 
+			       std::size_t aQueueSize, 
+			       std::size_t aTaskBufferSize) 
+
+  : JQueue(aName), mQueueSize(aQueueSize), mTaskBufferSize(aTaskBufferSize) {
+
+	aParams->SetDefaultParameter("JANA:QUEUE_DEBUG_LEVEL", 
+				     mDebugLevel, 
+				     "JQueueWithLock debug level");
 }
 
 //---------------------------------
 // JQueueWithLock    (Copy Constructor)
 //---------------------------------
-JQueueWithLock::JQueueWithLock(const JQueueWithLock& aQueue) : JQueueInterface(aQueue)
+JQueueWithLock::JQueueWithLock(const JQueueWithLock& aQueue) : JQueue(aQueue)
 {
 	//Assume this is called by CloneEmpty() or similar on an empty queue (ugh, can improve later)
 	mTaskBufferSize = aQueue.mTaskBufferSize;
+	mQueueSize = aQueue.mQueueSize;
 	mDebugLevel = aQueue.mDebugLevel;
 	mLogTarget = aQueue.mLogTarget;
 }
@@ -68,15 +75,16 @@ JQueueWithLock::JQueueWithLock(const JQueueWithLock& aQueue) : JQueueInterface(a
 JQueueWithLock& JQueueWithLock::operator=(const JQueueWithLock& aQueue)
 {
 	//Assume this is called by Clone() or similar on an empty queue (ugh, can improve later)
-	JQueueInterface::operator=(aQueue);
+	JQueue::operator=(aQueue);
 	mTaskBufferSize = aQueue.mTaskBufferSize;
+	mQueueSize = aQueue.mQueueSize;
 	return *this;
 }
 
 //---------------------------------
 // AddTask
 //---------------------------------
-JQueueInterface::Flags_t JQueueWithLock::AddTask(const std::shared_ptr<JTaskBase>& aTask)
+JQueue::Flags_t JQueueWithLock::AddTask(const std::shared_ptr<JTaskBase>& aTask)
 {
 	//We want to copy the task into the queue instead of moving it.
 	//However, we don't want to duplicate the complicated code in both functions.
@@ -99,7 +107,7 @@ JQueueInterface::Flags_t JQueueWithLock::AddTask(const std::shared_ptr<JTaskBase
 //---------------------------------
 // AddTask
 //---------------------------------
-JQueueInterface::Flags_t JQueueWithLock::AddTask(std::shared_ptr<JTaskBase>&& aTask)
+JQueue::Flags_t JQueueWithLock::AddTask(std::shared_ptr<JTaskBase>&& aTask)
 {
 	/// Add the given JTaskBase to this queue. This will do so without locks.
 	/// If the queue is full, it will return immediately with a value
@@ -118,9 +126,12 @@ JQueueInterface::Flags_t JQueueWithLock::AddTask(std::shared_ptr<JTaskBase>&& aT
 		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JQueueWithLock::AddTask(): Move-add task " << aTask.get() << ".\n" << JLogEnd();
 
 	std::lock_guard<std::mutex> sLock(mQueueLock);
+
+	if( mQueue.size() >= mQueueSize ) return Flags_t::kQUEUE_FULL;  // Queue is already full
+
 	mQueue.push_back(std::move(aTask));
 
-	return Flags_t::kNO_ERROR; //can never happen
+	return Flags_t::kNO_ERROR;
 }
 
 //---------------------------------
@@ -129,11 +140,11 @@ JQueueInterface::Flags_t JQueueWithLock::AddTask(std::shared_ptr<JTaskBase>&& aT
 uint32_t JQueueWithLock::GetMaxTasks(void)
 {
 	/// Returns maximum number of Tasks queue can hold at one time.
-	return 9999999; //too lazy to put right #
+	return mQueueSize;
 }
 
 //---------------------------------
-// GetEvent
+// GetTask
 //---------------------------------
 std::shared_ptr<JTaskBase> JQueueWithLock::GetTask(void)
 {
@@ -147,6 +158,7 @@ std::shared_ptr<JTaskBase> JQueueWithLock::GetTask(void)
 		return nullptr;
 	auto sTask = std::move(mQueue.front());
 	mQueue.pop_front();
+	mTasksProcessed++;
 
 	return sTask;
 }
@@ -155,6 +167,16 @@ std::shared_ptr<JTaskBase> JQueueWithLock::GetTask(void)
 // GetNumTasks
 //---------------------------------
 uint32_t JQueueWithLock::GetNumTasks(void)
+{
+	/// Returns the number of tasks currently in this queue.
+	/// n.b. this is an estimate since no lock is used
+	return mQueue.size();
+}
+
+//---------------------------------
+// GetNumTasksWithLock
+//---------------------------------
+uint32_t JQueueWithLock::GetNumTasksWithLock(void)
 {
 	/// Returns the number of tasks currently in this queue.
 	std::lock_guard<std::mutex> sLock(mQueueLock);
@@ -188,14 +210,14 @@ bool JQueueWithLock::AreEnoughTasksBuffered(void)
 {
 	//This function is only called for the Event queue
 	//If not enough tasks (events) are buffered, we will read in more events
-//	std::cout << "num tasks, buffer size = " << GetNumTasks() << ", " << mTaskBufferSize << "\n";
+	//std::cout << "num tasks, buffer size = " << GetNumTasks() << ", " << mTaskBufferSize << std::endl;
 	return (mTaskBufferSize == 0) ? (GetNumTasks() >= 1) : (GetNumTasks() >= mTaskBufferSize);
 }
 
 //---------------------------------
 // Clone
 //---------------------------------
-JQueueInterface* JQueueWithLock::CloneEmpty(void) const
+JQueue* JQueueWithLock::CloneEmpty(void) const
 {
 	//Create an empty clone of the queue (no tasks copied)
 	return (new JQueueWithLock(*this));

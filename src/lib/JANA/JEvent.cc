@@ -43,11 +43,9 @@
 //---------------------------------
 // JEvent    (Constructor)
 //---------------------------------
-JEvent::JEvent(JApplication* aApplication) : mApplication(aApplication), mThreadManager(mApplication->GetJThreadManager())
+JEvent::JEvent(JApplication* aApplication) : mApplication(aApplication), mThreadManager(nullptr)
 {
-	//Apparently segfaults
-//	gPARMS->SetDefaultParameter("JANA:EVENT_DEBUG_LEVEL", mDebugLevel, "JEvent debug level");
-//	mDebugLevel = 500;
+	if(mApplication != nullptr) mThreadManager = mApplication->GetJThreadManager();
 }
 
 //---------------------------------
@@ -55,7 +53,7 @@ JEvent::JEvent(JApplication* aApplication) : mApplication(aApplication), mThread
 //---------------------------------
 JEvent::~JEvent()
 {
-
+	Release();
 }
 
 //---------------------------------
@@ -67,15 +65,22 @@ JEventSource* JEvent::GetEventSource(void) const
 }
 
 //---------------------------------
-// SetEventSource
+// SetJApplication
 //---------------------------------
-void JEvent::SetEventSource(JEventSource* aSource, bool aIsBarrierEvent)
+void JEvent::SetJApplication(JApplication* app)
+{
+	mApplication = app;
+	if(mApplication != nullptr) mThreadManager = mApplication->GetJThreadManager();
+}
+
+//---------------------------------
+// SetJEventSource
+//---------------------------------
+void JEvent::SetJEventSource(JEventSource* aSource)
 {
 	mEventSource = aSource;
 	mEventSource->IncrementEventCount();
-	mIsBarrierEvent = aIsBarrierEvent;
-	if(mIsBarrierEvent)
-		mEventSource->IncrementBarrierCount();
+	if( mIsBarrierEvent ) mEventSource->IncrementBarrierCount();
 }
 
 //---------------------------------
@@ -92,13 +97,16 @@ void JEvent::SetFactorySet(JFactorySet* aFactorySet)
 void JEvent::Release(void)
 {
 	//Release all (pointers to) resources, called when recycled to pool
-	mApplication->Recycle(const_cast<JFactorySet*>(mFactorySet));
-	mFactorySet = nullptr;
+	if(mFactorySet != nullptr) {
+		mApplication->Recycle(const_cast<JFactorySet*>(mFactorySet));
+		mFactorySet = nullptr;
+	}
 
-	mEventSource->DecrementEventCount();
-	if(mIsBarrierEvent)
-		mEventSource->DecrementBarrierCount();
-	mEventSource = nullptr;
+	if(mEventSource != nullptr ){
+		mEventSource->DecrementEventCount();
+		if(mIsBarrierEvent) mEventSource->DecrementBarrierCount();
+		mEventSource = nullptr;
+	}
 
 	mLatestBarrierEvent = nullptr;
 	mIsBarrierEvent = false; //In case user forgets to clear it

@@ -54,22 +54,13 @@ using std::string;
 using std::deque;
 using std::map;
 
-#ifndef _DBG__
-#include <mutex>
-extern std::mutex DBG_MUTEX;
-#define _DBG_LOCK_ 
-#define _DBG_RELEASE_ 
-//#define _DBG_LOCK_ DBG_MUTEX.lock()
-//#define _DBG_RELEASE_ DBG_MUTEX.unlock()
-#define _DBG__ _DBG_LOCK_;std::cerr<<__FILE__<<":"<<__LINE__<<std::endl;_DBG_RELEASE_
-#define _DBG_ _DBG_LOCK_;std::cerr<<__FILE__<<":"<<__LINE__<<" "
-#endif
-
 #define jout std::cout
 #define jerr std::cerr
 
-#include "JResourcePool.h"
 #include <JANA/JParameterManager.h>
+#include <JANA/JLogger.h>
+#include <JANA/JResourcePool.h>
+#include <JANA/JResourcePoolSimple.h>
 
 class JApplication;
 class JEventProcessor;
@@ -78,21 +69,30 @@ class JEventSourceGenerator;
 class JFactoryGenerator;
 class JCalibrationGenerator;
 class JQueue;
-class JParameterManager;
-class JResourceManager;
 class JThread;
 class JEventSourceManager;
 class JThreadManager;
 class JFactorySet;
-class JLogWrapper;
 
 template <typename ReturnType>
 class JTask;
 
 extern JApplication *japp;
 
-
+//////////////////////////////////////////////////////////////////////////////////////////////////
+/// JANA application class (singleton).
+///
+/// The JApplication class serves as a central access point for getting to most things
+/// in the JANA application. It owns the JThreadManager, JParameterManager, etc.
+/// It is also responsible for making sure all of the plugins are attached and other
+/// user specified configurations for the run are implemented before starting the processing
+/// of the data. User code (e.g. plugins) will generally register things like event sources
+/// and processors with the JApplication so they can be called up later at the appropriate time.
+//////////////////////////////////////////////////////////////////////////////////////////////////
 class JApplication{
+
+
+
 	public:
 	
 		enum RETURN_STATUS{
@@ -101,31 +101,34 @@ class JApplication{
 			kTRY_AGAIN,
 			kUNKNOWN
 		};
-	
-		JApplication(int narg, char *argv[]);
+
+    JApplication(JParameterManager* params = nullptr, std::vector<string>* eventSources = nullptr);
 		virtual ~JApplication();
 
 		void AddSignalHandlers(void);
-		int GetExitCode(void);
+		int  GetExitCode(void);
 		void Initialize(void);
 		void PrintFinalReport(void);
 		void PrintStatus(void);
-		void Quit(void);
+		void Quit(bool skip_join=false);
 		void Run(uint32_t nthreads=0);
 		void SetExitCode(int exit_code);
 		void SetMaxThreads(uint32_t);
 		void SetTicker(bool ticker_on=true);
-		void Stop(void);
-		
-		void AddJEventProcessor(JEventProcessor *processor);
-		void AddJFactoryGenerator(JFactoryGenerator *factory_generator);
+		void Stop(bool wait_until_idle=false);
+		void Resume(void);
+
+		void Add(JEventSourceGenerator *source_generator);
+		void Add(JFactoryGenerator *factory_generator);
+		void Add(JEventProcessor *processor);
+
 		void AddPlugin(string plugin_name);
 		void AddPluginPath(string path);
 		
 		void GetJEventProcessors(vector<JEventProcessor*>& aProcessors);
 		void GetJFactoryGenerators(vector<JFactoryGenerator*> &factory_generators);
+		std::shared_ptr<JLogger> GetJLogger(void);
 		JParameterManager* GetJParameterManager(void);
-		JResourceManager* GetJResourceManager(void);
 		JThreadManager* GetJThreadManager(void) const;
 		JEventSourceManager* GetJEventSourceManager(void) const;
 		
@@ -133,54 +136,57 @@ class JApplication{
 		std::shared_ptr<JTask<void>> GetVoidTask(void);
 		JFactorySet* GetFactorySet(void);
 		void Recycle(JFactorySet* aFactorySet);
+		void UpdateResourceLimits(void);
 
-		uint32_t GetCPU(void);
 		uint64_t GetNtasksCompleted(string name="");
 		uint64_t GetNeventsProcessed(void);
 		float GetIntegratedRate(void);
 		float GetInstantaneousRate(void);
 		void GetInstantaneousRates(vector<double> &rates_by_queue);
 		void GetIntegratedRates(map<string,double> &rates_by_thread);
-		
+	
+		bool IsQuitting(void){ return _quitting; }
+		bool IsDrainingQueues(void){ return _draining_queues; }
+
 		void RemoveJEventProcessor(JEventProcessor *processor);
 		void RemoveJFactoryGenerator(JFactoryGenerator *factory_generator);
 		void RemovePlugin(string &plugin_name);
 
 		string Val2StringWithPrefix(float val);
 		template<typename T> T GetParameterValue(std::string name);
-
-		//LOG WRAPPERS
-		JLogWrapper* GetLogWrapper(uint32_t aLogIndex) const;
-		void SetLogWrapper(uint32_t aLogIndex, JLogWrapper* aLogWrapper);
-
+		template<typename T> JParameter* SetParameterValue(std::string name, T val);
+	
 	protected:
 	
-		vector<string> _args;	///< Argument list passed in to JApplication Constructor
 		int _exit_code;
+		bool _skip_join;
 		bool _quitting;
+		int _verbose;
 		bool _draining_queues;
+		bool _ticker_on;
+		std::chrono::time_point<std::chrono::high_resolution_clock> mRunStartTime;
 		std::vector<string> _plugins;
 		std::vector<string> _plugin_paths;
 		std::vector<void*> _sohandles;
-		std::vector<JThread*> _jthreads;
 		std::vector<JFactoryGenerator*> _factoryGenerators;
 		std::vector<JCalibrationGenerator*> _calibrationGenerators;
 		std::vector<JEventProcessor*> _eventProcessors;
+
+		std::shared_ptr<JLogger> _logger;
 		JParameterManager *_pmanager;
-		JResourceManager *_rmanager;
 		JEventSourceManager* _eventSourceManager;
 		JThreadManager* _threadManager;
-		std::map<uint32_t, JLogWrapper*> mLogWrappers;
-	
+		std::size_t mNumProcessorsAdded;
+
 		void AttachPlugins(void);
 		void AttachPlugin(string name, bool verbose=false);
 		
 	private:
 
-		//Resource pools
-		//TODO: Add methods to set control parameters
+		// Resource pools
+		// TODO: Add methods to set control parameters
 		JResourcePool<JTask<void>> mVoidTaskPool;
-		JResourcePool<JFactorySet> mFactorySetPool;
+		JResourcePoolSimple<JFactorySet> mFactorySetPool;
 
 };
 
@@ -195,6 +201,17 @@ T JApplication::GetParameterValue(std::string name)
 	return GetJParameterManager()->GetParameterValue<T>(name);
 }		
 
+//---------------------------------
+// SetParameterValue
+//---------------------------------
+template<typename T>
+JParameter* JApplication::SetParameterValue(std::string name, T val)
+{
+	/// This is a convenience function that just calls the SetParameter
+	/// of JParameterManager.
+	return GetJParameterManager()->SetParameter(name, val);
+}
+
 
 // This routine is used to bootstrap plugins. It is done outside
 // of the JApplication class to ensure it sees the global variables
@@ -204,7 +221,6 @@ inline void InitJANAPlugin(JApplication *app)
 	// Make sure global pointers are pointing to the 
 	// same ones being used by executable
 	japp = app;
-	gPARMS = app->GetJParameterManager();
 }
 
 #endif // _JApplication_h_

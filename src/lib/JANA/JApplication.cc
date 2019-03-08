@@ -39,17 +39,11 @@
 
 #include <unistd.h>
 #include <dlfcn.h>
-#include <signal.h>
 #include <sched.h>
-
-#ifdef __APPLE__
-#import <mach/thread_act.h>
-#include <cpuid.h>
-#endif  // __APPLE__
-
 #include <cstdlib>
 #include <sstream>
 #include <iostream>
+#include <iomanip>
 #include <unordered_set>
 using namespace std;
 
@@ -59,178 +53,49 @@ using namespace std;
 #include <JANA/JEventSource.h>
 #include <JANA/JEventSourceGenerator.h>
 #include <JANA/JFactoryGenerator.h>
-#include <JANA/JQueue.h>
+#include <JANA/JQueueSimple.h>
 #include <JANA/JParameterManager.h>
-#include <JANA/JResourceManager.h>
 #include <JANA/JEventSourceManager.h>
 #include <JANA/JThreadManager.h>
 #include <JANA/JThread.h>
 #include <JANA/JException.h>
 #include <JANA/JEvent.h>
 #include <JANA/JVersion.h>
-#include <JANA/JLog.h>
-#include <JANA/JStatus.h>
 #include <JANA/JResourcePool.h>
-#include <JANA/JLogWrapper.h>
+#include <JANA/JResourcePoolSimple.h>
+#include <JANA/JCpuInfo.h>
 
 JApplication *japp = NULL;
 
-int SIGINT_RECEIVED = 0;
-std::mutex DBG_MUTEX;
 
-//-----------------------------------------------------------------
-// ctrlCHandle
-//-----------------------------------------------------------------
-void ctrlCHandle(int x)
-{
-	SIGINT_RECEIVED++;
-	JLog(1) << "\nSIGINT received (" << SIGINT_RECEIVED << ").....\n" << JLogEnd();
-	
-	if(japp) japp->Quit();
-	
-	if(SIGINT_RECEIVED == 3){
-		JLog(1) << "\nThree SIGINTS received! Still attempting graceful exit ...\n" << JLogEnd();
-	}
-	if(SIGINT_RECEIVED == 6){
-		JLog(1) << "\nTSix SIGINTS received! OK, I get it! ...\n" << JLogEnd();
-		exit(-2);
-	}
-}
-
-//-----------------------------------------------------------------
-// USR1Handle
-//-----------------------------------------------------------------
-void USR1Handle(int x)
-{
-	thread th( JStatus::Report );
-	th.detach();
-}
-
-//-----------------------------------------------------------------
-// USR2Handle
-//-----------------------------------------------------------------
-void USR2Handle(int x)
-{
-	JStatus::RecordBackTrace();
-}
-
-//-----------------------------------------------------------------
-// SIGSEGVHandle
-//-----------------------------------------------------------------
-void SIGSEGVHandle(int aSignalNumber, siginfo_t* aSignalInfo, void* aContext)
-{
-	JStatus::Report();
-}
-
-//-----------------------------------------------------------------
-// AddSignalHandlers
-//-----------------------------------------------------------------
-void JApplication::AddSignalHandlers(void)
-{
-	//Define signal action
-	struct sigaction sSignalAction;
-	sSignalAction.sa_sigaction = SIGSEGVHandle;
-	sSignalAction.sa_flags = SA_RESTART | SA_SIGINFO;
-
-	//Clear and set signals
-	sigemptyset(&sSignalAction.sa_mask);
-	sigaction(SIGSEGV, &sSignalAction, nullptr);
-
-	// Set up to catch SIGINTs for graceful exits
-	signal(SIGINT,ctrlCHandle);
-
-	// Set up to catch USR1's and USR2's for status reporting
-	signal(SIGUSR1,USR1Handle);
-	signal(SIGUSR2,USR2Handle);
-}
 
 //---------------------------------
 // JApplication    (Constructor)
 //---------------------------------
-JApplication::JApplication(int narg, char *argv[])
+JApplication::JApplication(JParameterManager* params,
+                           std::vector<string>* eventSources)
 {
-	//Must do before setting loggers
-	japp = this;
-	_pmanager = new JParameterManager();
-
-	//Loggers //TODO: Switch to enum!! //Must be done before any code that uses a logger!
-	SetLogWrapper(0, new JLogWrapper(std::cout)); //stdout
-	SetLogWrapper(1, new JLogWrapper(std::cerr)); //stderr
-	SetLogWrapper(2, mLogWrappers[0]); //hd_dump
-
-	//Add to catch seg faults
-	AddSignalHandlers();
-
 	_exit_code = 0;
+	_verbose = 1;
 	_quitting = false;
 	_draining_queues = false;
-	_pmanager = NULL;
-	_rmanager = NULL;
+	_ticker_on = true;
+	mNumProcessorsAdded = 0;
+
+  _pmanager = (params == nullptr) ? new JParameterManager() : params;
+	_logger = std::shared_ptr<JLogger>(new JLogger());
 	_eventSourceManager = new JEventSourceManager(this);
 	_threadManager = new JThreadManager(this);
 
+  // TODO: Put this somewhere that makes sense
 	mVoidTaskPool.Set_ControlParams(200, 0); //TODO: Config these!!
 
-	// Loop over arguments
-	if(narg>0) _args.push_back(string(argv[0]));
-	for(int i=1; i<narg; i++){
-	
-		string arg  = argv[i];
-		string next = (i+1)<narg ? argv[i+1]:"";
-	
-		// Record arguments
-		_args.push_back( arg );
-	
-//		arg="--config=";
-//		if(!strncmp(arg, argv[i],strlen(arg))){
-//			string fname(&argv[i][strlen(arg)]);
-//			jparms->ReadConfigFile(fname);
-//			continue;
-//		}
-//		arg="--dumpcalibrations";
-//		if(!strncmp(arg, argv[i],strlen(arg))){
-//			dump_calibrations = true;
-//			continue;
-//		}
-//		arg="--dumpconfig";
-//		if(!strncmp(arg, argv[i],strlen(arg))){
-//			dump_configurations = true;
-//			continue;
-//		}
-//		arg="--listconfig";
-//		if(!strncmp(arg, argv[i],strlen(arg))){
-//			list_configurations = true;
-//			continue;
-//		}
-//		arg="--resourcereport";
-//		if(!strncmp(arg, argv[i],strlen(arg))){
-//			print_resource_report = true;
-//			continue;
-//		}
-		if( arg.find("-P") == 0 ){
-			auto pos = arg.find("=");
-			if( (pos!= string::npos) && (pos>2) ){
-				string key = arg.substr(2, pos-2);
-				string val = arg.substr(pos+1);
-				GetJParameterManager()->SetParameter(key, val);
-			}else{
-				_DBG_ << " bad parameter argument (" << arg << ") should be of form -Pkey=value" << endl;
-			}
-			continue;
-		}
-		if( arg == "--janaversion" ) {
-			JLog() << "          JANA version: "<<JVersion::GetVersion()<< "\n" <<
-			          "        JANA ID string: "<<JVersion::GetIDstring()<< "\n" <<
-			          "     JANA SVN revision: "<<JVersion::GetRevision()<< "\n" <<
-			          "JANA last changed date: "<<JVersion::GetDate()<< "\n" <<
-			          "              JANA URL: "<<JVersion::GetSource()<< "\n" << JLogEnd();
-			continue;
-		}
-		if( arg.find("-") == 0 )continue;
-
-		JLog() << "add source: "<< arg << "\n" << JLogEnd();
-		_eventSourceManager->AddEventSource(arg);
-	}
+  if (eventSources != nullptr) {
+    for (string & e : *eventSources) {
+      LOG_INFO(_logger) << "Adding source: " << e << "\n" << LOG_END;
+      _eventSourceManager->AddEventSource(e);
+    }
+  }
 }
 
 //---------------------------------
@@ -238,7 +103,11 @@ JApplication::JApplication(int narg, char *argv[])
 //---------------------------------
 JApplication::~JApplication()
 {
-
+	for( auto p: _factoryGenerators     ) delete p;
+	for( auto p: _eventProcessors       ) delete p;
+	if( _pmanager           ) delete _pmanager;
+	if( _threadManager      ) delete _threadManager;
+	if( _eventSourceManager ) delete _eventSourceManager;
 }
 
 //---------------------------------
@@ -250,10 +119,11 @@ void JApplication::AttachPlugins(void)
 	/// actually attach and intiailize them. See AddPlugin method
 	/// for more.
 	
-	bool printPaths=false;
-	try{
-		GetJParameterManager()->GetParameter("PRINT_PLUGIN_PATHS", printPaths);
-	}catch(...){}
+	bool printPaths = false;
+	GetJParameterManager()->SetDefaultParameter(
+		"JANA:DEBUG_PLUGIN_LOADING", 
+		printPaths, 
+		"Trace the plugin search path and display any loading errors");
 	
 	// In order to give priority to factories added via plugins,
 	// the list of factory generators needs to be cleared so
@@ -294,6 +164,7 @@ void JApplication::AttachPlugins(void)
 	}catch(...){}
 	
 	// Loop over plugins
+	stringstream err_mess;
 	for(string plugin : _plugins){
 		// Sometimes, the user will include the ".so" suffix in the
 		// plugin name. If they don't, then we add it here.
@@ -303,28 +174,30 @@ void JApplication::AttachPlugins(void)
 		bool found_plugin=false;
 		for(string path : _plugin_paths){
 			string fullpath = path + "/" + plugin;
-			if(printPaths)
-				JLog() << "Looking for \""<<fullpath<<"\" ....\n" << JLogEnd();
-			if( access( fullpath.c_str(), F_OK ) != -1 ){
-				if(printPaths)
-					JLog() << "Found\n" << JLogEnd();
+			LOG_TRACE(_logger, printPaths) << "Looking for '" << fullpath << "' ...." << LOG_END;
+			if (access(fullpath.c_str(), F_OK) != -1) {
+				LOG_TRACE(_logger, printPaths) << "Found!" << LOG_END;
 				try{
 					AttachPlugin(fullpath.c_str(), printPaths);
 					found_plugin=true;
 					break;
-				}catch(...){
+				} catch(...) {
+					err_mess << "Tried to attach: \"" << fullpath << "\"" << endl;
+					err_mess << "  -- error message: " << dlerror() << endl;
 					continue;
 				}
 			}
-			if(printPaths)
-				JLog() << "Failed to attach \""<<fullpath<<"\"\n" << JLogEnd();
+			LOG_TRACE(_logger, printPaths) << "Failed to attach '" << fullpath << "'" << LOG_END;
 		}
 		
 		// If we didn't find the plugin, then complain and quit
 		if(!found_plugin){
-			JLog(1) << "\n***ERROR : Couldn't find plugin \""<<plugin<<"\"!***\n" <<
-			             "***        make sure the JANA_PLUGIN_PATH environment variable is set correctly.\n"<<
-			             "***        To see paths checked, set PRINT_PLUGIN_PATHS config. parameter\n"<< JLogEnd();
+
+			LOG_FATAL(_logger) << "\n*** Couldn't find plugin '" << plugin << "'! ***\n" <<
+			             "***        Make sure the JANA_PLUGIN_PATH environment variable is set correctly.\n" <<
+			             "***        To see paths checked, set JANA:DEBUG_PLUGIN_LOADING=1\n"<<
+				     "***        Some hints to the error follow:\n\n" << err_mess.str() << LOG_END;
+
 			exit(-1);
 		}
 	}
@@ -341,24 +214,37 @@ void JApplication::AttachPlugins(void)
 //---------------------------------
 void JApplication::AttachPlugin(string soname, bool verbose)
 {
+	/// Attach a plugin by opening the shared object file and running the
+	/// InitPlugin_t(JApplication* app) global C-style routine in it.
+	/// An exception will be thrown if the plugin is not successfully opened.
+	/// Users will not need to call this directly since it is called automatically
+	/// from Initialize().
+	///
+	/// @param soname name of shared object file to attach. This may include
+	///               an absolute or relative path.
+	///
+	/// @param verbose if set to true, failed attempts will be recorded via the
+	///                JLog. Default is false so JANA can silently ignore files
+	///                that are not valid plugins.
+	///
+
 	// Open shared object
 	void* handle = dlopen(soname.c_str(), RTLD_LAZY | RTLD_GLOBAL | RTLD_NODELETE);
 	if(!handle){
-		if(verbose)JLog(1)<<dlerror()<<"\n" << JLogEnd();
-		return;
+		LOG_TRACE(_logger, verbose) << dlerror() << LOG_END;
+		throw "dlopen failed";
 	}
 	
 	// Look for an InitPlugin symbol
 	typedef void InitPlugin_t(JApplication* app);
 	InitPlugin_t *plugin = (InitPlugin_t*)dlsym(handle, "InitPlugin");
 	if(plugin){
-		JLog() << "Initializing plugin \""<<soname<<"\" ...\n" << JLogEnd();
+		LOG_INFO(_logger) << "Initializing plugin \"" << soname << "\"" << LOG_END;
 		(*plugin)(this);
 		_sohandles.push_back(handle);
 	}else{
 		dlclose(handle);
-		if(verbose)
-			JLog() << " --- Nothing useful found in" << soname << " ---\n" << JLogEnd();
+		LOG_TRACE(_logger, verbose) << "Nothing useful found in " << soname << LOG_END;
 	}
 }
 
@@ -376,8 +262,13 @@ void JApplication::AddPlugin(string plugin_name)
 	/// if it is already there. This may be important if the order
 	/// of plugins is important. It is left to the user to handle
 	/// in those cases.
+	///
+	/// @param plugin_name name of the plugin. Do not include the
+	///                    ".so" or ".dylib" suffix in the name.
+	///                    The path to the plugin will be searched
+	///                    from the JANA_PLUGIN_PATH envar.
+	///
 	for( string &n : _plugins) if( n == plugin_name ) return;
-_DBG_<<"Adding plugin " << plugin_name << endl;
 	_plugins.push_back(plugin_name);
 }
 
@@ -388,10 +279,17 @@ void JApplication::AddPluginPath(string path)
 {
 	/// Add a path to the directories searched for plugins. This
 	/// should not include the plugin name itself. This only has
-	/// an effect when called before AttchPlugins is called
+	/// an effect when called before AttachPlugins is called
 	/// (i.e. before Run is called).
 	/// n.b. if this is called with a path already in the list,
 	/// then the call is silently ignored.
+	///
+	/// Generally, users will set the path via the JANA_PLUGIN_PATH
+	/// environment variable and won't need to call this method. This
+	/// may be called if it needs to be done programmatically.
+	///
+	/// @param path directory to search fpr plugins.
+	///
 	for( string &n : _plugin_paths) if( n == path ) return;
 	_plugin_paths.push_back(path);
 }
@@ -414,6 +312,10 @@ int JApplication::GetExitCode(void)
 //---------------------------------
 void JApplication::Initialize(void)
 {
+	/// Initialize the application in preparation for data processing.
+	/// This is called by the Run method so users will usually not
+	/// need to call this directly.
+
 	// Attach all plugins
 	AttachPlugins();
 
@@ -446,8 +348,13 @@ void JApplication::Initialize(void)
 void JApplication::PrintFinalReport(void)
 {
 	//Get queues
-	std::vector<JThreadManager::JEventSourceInfo*> sAllQueues;
-	_threadManager->GetRetiredSourceInfos(sAllQueues);
+	std::vector<JThreadManager::JEventSourceInfo*> sRetiredQueues;
+	_threadManager->GetRetiredSourceInfos(sRetiredQueues);
+	std::vector<JThreadManager::JEventSourceInfo*> sActiveQueues;
+	_threadManager->GetActiveSourceInfos(sActiveQueues);
+	auto sAllQueues = sRetiredQueues;
+	sAllQueues.insert(sAllQueues.end(), sActiveQueues.begin(), sActiveQueues.end());
+
 
 	// Get longest JQueue name
 	uint32_t sSourceMaxNameLength = 0, sQueueMaxNameLength = 0;
@@ -458,7 +365,7 @@ void JApplication::PrintFinalReport(void)
 		if(sSourceLength > sSourceMaxNameLength)
 			sSourceMaxNameLength = sSourceLength;
 
-		std::map<JQueueSet::JQueueType, std::vector<JQueueInterface*>> sSourceQueues;
+		std::map<JQueueSet::JQueueType, std::vector<JQueue*>> sSourceQueues;
 		sSourceInfo->mQueueSet->GetQueues(sSourceQueues);
 		for(auto& sTypePair : sSourceQueues)
 		{
@@ -471,36 +378,74 @@ void JApplication::PrintFinalReport(void)
 		}
 	}
 	sSourceMaxNameLength += 2;
-	if(sSourceMaxNameLength < 8)
-		sSourceMaxNameLength = 8;
+	if(sSourceMaxNameLength < 8) sSourceMaxNameLength = 8;
 	sQueueMaxNameLength += 2;
-	if(sQueueMaxNameLength < 7)
-		sQueueMaxNameLength = 7;
+	if(sQueueMaxNameLength < 7) sQueueMaxNameLength = 7;
 
 	jout << std::endl;
 	jout << "Final Report" << std::endl;
-	jout << std::string(sSourceMaxNameLength + sQueueMaxNameLength + 9, '-') << std::endl;
-	jout << "Source" << std::string(sSourceMaxNameLength - 6, ' ') << "Queue" << std::string(sQueueMaxNameLength - 5, ' ') << "NTasks" << std::endl;
-	jout << std::string(sSourceMaxNameLength + sQueueMaxNameLength + 9, '-') << std::endl;
+	jout << std::string(sSourceMaxNameLength + 12 + sQueueMaxNameLength + 9, '-') << std::endl;
+	jout << "Source" << std::string(sSourceMaxNameLength - 6, ' ') << "   Nevents  " << "Queue" << std::string(sQueueMaxNameLength - 5, ' ') << "NTasks" << std::endl;
+	jout << std::string(sSourceMaxNameLength + 12 + sQueueMaxNameLength + 9, '-') << std::endl;
+	std::size_t sSrcIdx = 0;
 	for(auto& sSourceInfo : sAllQueues)
 	{
+		// Flag to prevent source name and number of events from
+		// printing more than once.
+		bool sSourceNamePrinted = false;
+
+		// Place "*" next to names of active sources
+		string sFlag;
+		if( sSrcIdx++ >= sRetiredQueues.size() ) sFlag="*";
+
 		auto sSource = sSourceInfo->mEventSource;
-		std::map<JQueueSet::JQueueType, std::vector<JQueueInterface*>> sSourceQueues;
+		std::map<JQueueSet::JQueueType, std::vector<JQueue*>> sSourceQueues;
 		sSourceInfo->mQueueSet->GetQueues(sSourceQueues);
 		for(auto& sTypePair : sSourceQueues)
 		{
 			for(auto sQueue : sTypePair.second)
 			{
-				jout << sSource->GetName() << string(sSourceMaxNameLength - sSource->GetName().size(), ' ')
-						<< sQueue->GetName() << string(sQueueMaxNameLength - sQueue->GetName().size(), ' ')
-						<< sQueue->GetNumTasksProcessed() << std::endl;
+				string sSourceName = sSource->GetName()+sFlag;
+
+				if( sSourceNamePrinted ){
+					jout << string(sSourceMaxNameLength + 12, ' ');
+				}else{
+					sSourceNamePrinted = true;
+					jout << sSourceName << string(sSourceMaxNameLength - sSourceName.size(), ' ')
+					     << std::setw(10) << sSource->GetNumEventsProcessed() << "  ";
+				}
+
+				jout << sQueue->GetName() << string(sQueueMaxNameLength - sQueue->GetName().size(), ' ')
+					 << sQueue->GetNumTasksProcessed() << std::endl;
 			}
 		}
 	}
+	if( !sActiveQueues.empty() ){
+		jout << std::endl;
+		jout << "(*) indicates sources that were still active" << std::endl;
+	}
+
 	jout << std::endl;
+	jout << "Total events processed: " << GetNeventsProcessed() << " (~ " << Val2StringWithPrefix( GetNeventsProcessed() ) << "evt)" << std::endl;
 	jout << "Integrated Rate: " << Val2StringWithPrefix( GetIntegratedRate() ) << "Hz" << std::endl;
 	jout << std::endl;
 
+	// Optionally print more info if user requested it:
+	bool print_extended_report = false;
+	_pmanager->SetDefaultParameter("JANA:EXTENDED_REPORT", print_extended_report);
+	if( print_extended_report ){
+		jout << std::endl;
+		jout << "Extended Report" << std::endl;
+		jout << std::string(sSourceMaxNameLength + 12 + sQueueMaxNameLength + 9, '-') << std::endl;
+		jout << "               Num. plugins: " << _plugins.size() <<std::endl;
+		jout << "          Num. plugin paths: " << _plugin_paths.size() <<std::endl;
+		jout << "    Num. factory generators: " << _factoryGenerators.size() <<std::endl;
+		jout << "Num. calibration generators: " << _calibrationGenerators.size() <<std::endl;
+		jout << "      Num. event processors: " << mNumProcessorsAdded <<std::endl;
+		jout << "          Num. factory sets: " << mFactorySetPool.Get_PoolSize() << " (max. " << mFactorySetPool.Get_MaxPoolSize() << ")" << std::endl;
+		jout << "       Num. config. params.: " << _pmanager->GetNumParameters() <<std::endl;
+		jout << "               Num. threads: " << _threadManager->GetNJThreads() <<std::endl;
+	}
 }
 
 //---------------------------------
@@ -518,10 +463,12 @@ void JApplication::PrintStatus(void)
 //---------------------------------
 // Quit
 //---------------------------------
-void JApplication::Quit(void)
+void JApplication::Quit(bool skip_join)
 {
 	_threadManager->EndThreads();
+	_skip_join = skip_join;
 	_quitting = true;
+
 }
 
 //---------------------------------
@@ -532,8 +479,8 @@ void JApplication::Run(uint32_t nthreads)
 	// Set number of threads
 	try{
 		string snthreads = GetParameterValue<string>("NTHREADS");
-		if( snthreads == "Ncores" ){
-			nthreads = _threadManager->GetNcores();
+		if( snthreads == "Ncores" ) {
+			nthreads = JCpuInfo::GetNumCpus();
 		}else{
 			stringstream ss(snthreads);
 			ss >> nthreads;
@@ -543,6 +490,9 @@ void JApplication::Run(uint32_t nthreads)
 
 	// Setup all queues and attach plugins
 	Initialize();
+
+	// If something went wrong in Initialize() then we may be quitting early.
+	if(_quitting) return;
 
 	// Create all remaining threads (one may have been created in Init)
 	jout << "Creating " << nthreads << " processing threads ..." << endl;
@@ -555,11 +505,12 @@ void JApplication::Run(uint32_t nthreads)
 		_threadManager->SetThreadAffinity( affinity_algorithm );
 	}catch(...){}
 	
-	// Print summary of config. parameters (if any aren't default)
-	GetJParameterManager()->PrintParameters();
+	// Print summary of all config parameters (if any aren't default)
+	GetJParameterManager()->PrintParameters(true);
 
 	// Start all threads running
 	jout << "Start processing ..." << endl;
+	mRunStartTime = std::chrono::high_resolution_clock::now();
 	_threadManager->RunThreads();
 
 	// Monitor status of all threads
@@ -572,7 +523,7 @@ void JApplication::Run(uint32_t nthreads)
 			_draining_queues = _eventSourceManager->AreAllFilesClosed();
 		
 		// Check if all threads have finished
-		if(_threadManager->HaveAllThreadsEnded())
+		if(_threadManager->AreAllThreadsEnded())
 		{
 			std::cout << "All threads have ended.\n";
 			break;
@@ -582,19 +533,22 @@ void JApplication::Run(uint32_t nthreads)
 		std::this_thread::sleep_for( std::chrono::milliseconds(500) );
 		
 		// Print status
-		PrintStatus();
+		if( _ticker_on ) PrintStatus();
 	}
 	
 	// Join all threads
 	jout << "Event processing ended. " << endl;
-	if( SIGINT_RECEIVED <= 1 ){
+	if (!_skip_join) {
 		cout << "Merging threads ..." << endl;
 		_threadManager->JoinThreads();
 	}
 	
 	// Delete event processors
-	for(auto sProcessor : _eventProcessors)
+	for(auto sProcessor : _eventProcessors){
+		sProcessor->Finish(); // (this may not be necessary since it is always next to destructor)
 		delete sProcessor;
+	}
+	_eventProcessors.clear();
 
 	// Report Final numbers
 	PrintFinalReport();
@@ -627,35 +581,62 @@ void JApplication::SetMaxThreads(uint32_t)
 //---------------------------------
 void JApplication::SetTicker(bool ticker_on)
 {
-	
+	_ticker_on = ticker_on;
 }
-
-
 
 //---------------------------------
 // Stop
 //---------------------------------
-void JApplication::Stop(void)
+void JApplication::Stop(bool wait_until_idle)
 {
-	
+	/// Tell all JThread objects to go into the idle state after completing
+	/// their current task. If wait_until_idle is true, this will block until
+	/// all threads are in the idle state. If false (the default), it will return
+	/// immediately after telling all threads to go into the idle state
+	_threadManager->StopThreads(wait_until_idle);
 }
 
 //---------------------------------
-// AddJEventProcessor
+// Resume
 //---------------------------------
-void JApplication::AddJEventProcessor(JEventProcessor *processor)
+void JApplication::Resume(void)
 {
-	_eventProcessors.push_back( processor );
+	/// Tell all JThread objects to go into the running state (if not already
+	/// there).
+	_threadManager->RunThreads();
 }
 
 //---------------------------------
-// AddJFactoryGenerator
+// Add - JEventSourceGenerator
 //---------------------------------
-void JApplication::AddJFactoryGenerator(JFactoryGenerator *factory_generator)
+void JApplication::Add(JEventSourceGenerator *source_generator)
 {
 	/// Add the given JFactoryGenerator to the list of queues
+	///
+	/// @param source_generator pointer to source generator to add. Ownership is passed to JApplication
+
+	GetJEventSourceManager()->AddJEventSourceGenerator( source_generator );
+}
+
+//---------------------------------
+// Add - JFactoryGenerator
+//---------------------------------
+void JApplication::Add(JFactoryGenerator *factory_generator)
+{
+	/// Add the given JFactoryGenerator to the list of queues
+	///
+	/// @param factory_generator pointer to factory generator to add. Ownership is passed to JApplication
 
 	_factoryGenerators.push_back( factory_generator );
+}
+
+//---------------------------------
+// Add - JEventProcessor
+//---------------------------------
+void JApplication::Add(JEventProcessor *processor)
+{
+	_eventProcessors.push_back( processor );
+	mNumProcessorsAdded++;
 }
 
 //---------------------------------
@@ -675,6 +656,15 @@ void JApplication::GetJFactoryGenerators(vector<JFactoryGenerator*> &factory_gen
 }
 
 //---------------------------------
+// GetJLogger
+//---------------------------------
+std::shared_ptr<JLogger> JApplication::GetJLogger(void) 
+{
+	return _logger;
+}
+
+
+//---------------------------------
 // GetJParameterManager
 //---------------------------------
 JParameterManager* JApplication::GetJParameterManager(void)
@@ -686,15 +676,6 @@ JParameterManager* JApplication::GetJParameterManager(void)
 	return _pmanager;
 }
 
-//---------------------------------
-// GetJResourceManager
-//---------------------------------
-JResourceManager* JApplication::GetJResourceManager(void)
-{
-	/// Return pointer to the JResourceManager object.
-
-	return _rmanager;
-}
 
 //---------------------------------
 // GetJThreadManager
@@ -712,66 +693,6 @@ JEventSourceManager* JApplication::GetJEventSourceManager(void) const
 	return _eventSourceManager;
 }
 
-//---------------------------------
-// GetCPU
-//---------------------------------
-uint32_t JApplication::GetCPU(void)
-{
-	/// Returns the current CPU the calling thread is running on.
-	/// Note that unless the thread affinity has been set, this may 
-	/// change, even before returning from this call. The thread
-	/// affinity of all threads may be fixed by setting the AFFINITY
-	/// configuration parameter at program start up.
-
-	int cpuid;
-
-#ifdef __APPLE__
-
-	//--------- Mac OS X ---------
-
-// From https://stackoverflow.com/questions/33745364/sched-getcpu-equivalent-for-os-x
-#define CPUID(INFO, LEAF, SUBLEAF) __cpuid_count(LEAF, SUBLEAF, INFO[0], INFO[1], INFO[2], INFO[3])
-#define GETCPU(CPU) {                              \
-        uint32_t CPUInfo[4];                           \
-        CPUID(CPUInfo, 1, 0);                          \
-        /* CPUInfo[1] is EBX, bits 24-31 are APIC ID */ \
-        if ( (CPUInfo[3] & (1 << 9)) == 0) {           \
-          CPU = -1;  /* no APIC on chip */             \
-        }                                              \
-        else {                                         \
-          CPU = (unsigned)CPUInfo[1] >> 24;                    \
-        }                                              \
-        if (CPU < 0) CPU = 0;                          \
-      }
-
-	GETCPU(cpuid);
-#else  // __APPLE__
-
-	//--------- Linux ---------
-	cpuid = sched_getcpu();
-
-#endif // __APPLE__
-
-
-	return cpuid;
-}
-
-//---------------------------------
-// SetLogWrapper
-//---------------------------------
-void JApplication::SetLogWrapper(uint32_t aLogIndex, JLogWrapper* aLogWrapper)
-{
-	mLogWrappers.emplace(aLogIndex, aLogWrapper);
-}
-
-//---------------------------------
-// GetLogWrapper
-//---------------------------------
-JLogWrapper* JApplication::GetLogWrapper(uint32_t aLogIndex) const
-{
-	auto sIterator = mLogWrappers.find(aLogIndex);
-	return ((sIterator != std::end(mLogWrappers)) ? sIterator->second : nullptr);
-}
 
 //---------------------------------
 // GetVoidTask
@@ -798,6 +719,28 @@ void JApplication::Recycle(JFactorySet* aFactorySet)
 }
 
 //---------------------------------
+// UpdateResourceLimits
+//---------------------------------
+void JApplication::UpdateResourceLimits(void)
+{
+	/// Used internally by JANA to adjust the maximum size of resource
+	/// pools after changing the number of threads.
+
+	// OK, this is tricky. The max size of the JFactorySet resource pool should
+	// be at least as big as how many threads we have. Factory sets may also be
+	// attached to JEvent objects in queues that are not currently being acted
+	// on by a thread so we actually need the maximum to be larger if we wish to
+	// prevent constant allocation/deallocation of factory sets. If the factory
+	// sets are large, this will cost more memory, but should save on CPU from
+	// allocating less often and not having to call the constructors repeatedly.
+	// The exact maximum is hard to determine here. We set it to twice the number
+	// of threads which should be sufficient. The user should be given control to
+	// adjust this themselves in the future, but or now, this should be OK.
+	auto nthreads = _threadManager->GetNJThreads();
+	mFactorySetPool.Set_ControlParams( nthreads*2, 10 );
+}
+
+//---------------------------------
 // GetNtasksCompleted
 //---------------------------------
 uint64_t JApplication::GetNtasksCompleted(string name)
@@ -819,19 +762,15 @@ uint64_t JApplication::GetNeventsProcessed(void)
 //---------------------------------
 float JApplication::GetIntegratedRate(void)
 {
-	// Once we start draining the queues, freez the integrated
-	// rate so it is not distorted by the wind down
+	/// Returns the total integrated rate so far in Hz since
+	/// Run was called.
+
 	static float last_R = 0.0;
-	if( _draining_queues ) return last_R;
 
 	auto now = std::chrono::high_resolution_clock::now();
-	uint64_t N = GetNeventsProcessed();
-	static auto start_t = now;
-	static uint64_t start_N = N;
-
-	std::chrono::duration<float> delta_t = now - start_t;
+	std::chrono::duration<float> delta_t = now - mRunStartTime;
 	float delta_t_seconds = delta_t.count();
-	float delta_N = (float)(GetNeventsProcessed() - start_N);
+	float delta_N = (float)GetNeventsProcessed();
 
 	if( delta_t_seconds >= 0.5) {
 		last_R = delta_N / delta_t_seconds;

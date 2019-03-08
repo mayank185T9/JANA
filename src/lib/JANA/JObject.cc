@@ -38,13 +38,15 @@
 //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
 #include "JObject.h"
+#include "JFunctions.h"
 
 //---------------------------------
 // JObject    (Constructor)
 //---------------------------------
 JObject::JObject()
 {
-
+	// call className() instead so we don't waste CPU on this if it's not used
+//	mName = GetDemangledName< decltype(*this) >();
 }
 
 //---------------------------------
@@ -54,3 +56,15 @@ JObject::~JObject()
 {
 
 }
+
+//---------------------------------
+// className
+//---------------------------------
+const std::string& JObject::className(void) const
+{
+		if(mName.empty()) mName=GetDemangledName< decltype(*this) >();
+		return mName;
+}
+
+
+

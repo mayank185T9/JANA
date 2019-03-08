@@ -50,7 +50,18 @@ using namespace std;
 //---------------------------------
 JEventSourceManager::JEventSourceManager(JApplication* aApp) : mApplication(aApp)
 {
-	gPARMS->SetDefaultParameter("JANA:MAX_NUM_OPEN_SOURCES", mMaxNumOpenFiles, "Max # input sources that can be open simultaneously");
+	aApp->GetJParameterManager()->SetDefaultParameter(
+		"JANA:MAX_NUM_OPEN_SOURCES", 
+		mMaxNumOpenFiles, 
+		"Max # input sources that can be open simultaneously");
+}
+
+//---------------------------------
+// Destructor
+//---------------------------------
+JEventSourceManager::~JEventSourceManager()
+{
+	for(auto p : _eventSourceGenerators) delete p;
 }
 
 //---------------------------------
@@ -81,6 +92,7 @@ void JEventSourceManager::AddJEventSource(JEventSource *source)
 void JEventSourceManager::AddJEventSourceGenerator(JEventSourceGenerator *source_generator)
 {
 	/// Add the given JEventSourceGenerator to the list of queues
+	source_generator->SetJApplication( mApplication );
 	_eventSourceGenerators.push_back( source_generator );
 }
 
@@ -188,12 +200,15 @@ JEventSource* JEventSourceManager::CreateSource(const std::string& source_name)
 	// Try opening the source using the chosen generator
 	JEventSource *new_source = nullptr;
 	if(gen != nullptr){
-		jout << "Opening source \"" << source_name << "\" of type: "<< gen->Description() << endl;
+		jout << "Opening source \"" << source_name << "\" - "<< gen->GetType() << " : " << gen->GetDescription() << endl;
 		new_source = gen->MakeJEventSource(source_name);
 	}
 
-	if(new_source)
+	if(new_source != nullptr){
+		new_source->SetJApplication(mApplication);
+		_sources_allocated.push_back(std::shared_ptr<JEventSource>(new_source)); // ensure destruction
 		return new_source;
+	}
 
 	// Problem opening source. Notify user
 	jerr<<std::endl;
@@ -260,7 +275,7 @@ void JEventSourceManager::RemoveJEventSourceGenerator(JEventSourceGenerator *sou
 }
 
 //---------------------------------
-// GetUserEventSourceGenerator
+// GetEventSourceGenerator
 //---------------------------------
 JEventSourceGenerator* JEventSourceManager::GetEventSourceGenerator(const std::string& source_name)
 {
@@ -297,7 +312,7 @@ JEventSourceGenerator* JEventSourceManager::GetUserEventSourceGenerator(void)
 	try{
 		std::string EVENT_SOURCE_TYPE = mApplication->GetParameterValue<string>("EVENT_SOURCE_TYPE");
 		for( auto sg : _eventSourceGenerators ){
-			if( sg->GetName() == EVENT_SOURCE_TYPE ){
+			if( sg->GetType() == EVENT_SOURCE_TYPE ){
 				gen = sg;
 				jout << "Forcing use of event source type: " << EVENT_SOURCE_TYPE << endl;
 				break;
@@ -310,7 +325,7 @@ JEventSourceGenerator* JEventSourceManager::GetUserEventSourceGenerator(void)
 			jerr << " be used to read the event sources but no such type exists." << endl;
 			jerr << " Here is a list of available source types:" << endl;
 			jerr << endl;
-			for( auto sg : _eventSourceGenerators ) jerr << "   " << sg->GetName() << endl;
+			for( auto sg : _eventSourceGenerators ) jerr << "   " << sg->GetType() << endl;
 			jerr << endl;
 			jerr << "-----------------------------------------------------------------" << endl;
 			mApplication->SetExitCode(-1);
@@ -347,6 +362,6 @@ bool JEventSourceManager::AreAllFilesClosed(void) const
 	if(!_sources_unopened.empty())
 		return false;
 
-	auto sClosedChecker = [](JEventSource* aSource) -> bool {return aSource->IsFileClosed();};
+	auto sClosedChecker = [](JEventSource* aSource) -> bool {return aSource->IsExhausted();};
 	return std::all_of(std::begin(_sources_active), std::end(_sources_active), sClosedChecker);
 }

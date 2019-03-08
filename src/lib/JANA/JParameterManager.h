@@ -48,13 +48,13 @@
 #define _JParameterManager_h_
 
 #include <string>
+#include <algorithm>
 #include <map>
 
 #include <JANA/JParameter.h>
 #include <JANA/JException.h>
 
 class JParameterManager;
-extern JParameterManager *gPARMS;
 
 class JParameterManager{
 	public:
@@ -64,6 +64,7 @@ class JParameterManager{
 		bool Exists(std::string name);
 		JParameter* FindParameter(std::string);
 		void PrintParameters(bool all=false);
+		std::size_t GetNumParameters(void){ return _jparameters.size(); }
 
 		template<typename T>
 		JParameter* GetParameter(std::string name, T &val);
@@ -79,6 +80,11 @@ class JParameterManager{
 
 	protected:
 	
+		// When accessing the _jparameters map strings are always converted to
+		// lower case. This effectively makes configuration parameters case-insensitve
+		// while allowing users to use case and have that stored as the actual parameter
+		// name
+		string ToLC(string &name){std::string tmp(name); std::transform(tmp.begin(), tmp.end(), tmp.begin(), ::tolower); return tmp;}
 		std::map<std::string, JParameter*> _jparameters;
 	
 	private:
@@ -93,7 +99,7 @@ JParameter* JParameterManager::GetParameter(std::string name, T &val)
 {	
 	if( ! Exists(name) ) return NULL;
 
-	auto jpar = _jparameters[name];
+	auto jpar = _jparameters[ ToLC(name) ];
 	jpar->GetValue( val );
 	return jpar;
 }		
@@ -106,7 +112,7 @@ T JParameterManager::GetParameterValue(std::string name)
 {	
 	if( ! Exists(name) ) throw JException("Unknown parameter \"%s\"", name.c_str());
 
-	return _jparameters[name]->GetValue<T>();
+	return _jparameters[ ToLC(name) ]->GetValue<T>();
 }		
 
 //---------------------------------
@@ -241,12 +247,12 @@ template<typename T>
 JParameter* JParameterManager::SetParameter(std::string name, T val)
 {	
 	if( !Exists(name) ) {
-		_jparameters[name] = new JParameter(name, val);
+		_jparameters[ ToLC(name) ] = new JParameter(name, val);
 	}else{
-		_jparameters[name]->SetValue( val );
+		_jparameters[ ToLC(name) ]->SetValue( val );
 	}
 
-	return _jparameters[name];
+	return _jparameters[ ToLC(name) ];
 }		
 
 #endif // _JParameterManager_h_

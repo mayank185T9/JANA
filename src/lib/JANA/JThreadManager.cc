@@ -45,6 +45,8 @@
 #include <algorithm>
 #include <unistd.h>
 #include <tuple>
+#include <chrono>
+#include <thread>
 
 #ifdef __APPLE__
 #include <mach/thread_policy.h>
@@ -55,9 +57,10 @@
 #include "JEventSource.h"
 #include "JApplication.h"
 #include "JEventSourceManager.h"
-#include "JQueue.h"
+#include "JQueueSimple.h"
 #include "JEvent.h"
 #include "JThread.h"
+#include "JCpuInfo.h"
 
 #include <pthread.h>
 #include <signal.h>
@@ -65,14 +68,27 @@
 //---------------------------------
 // JThreadManager
 //---------------------------------
-JThreadManager::JThreadManager(JApplication* aApplication) : mApplication(aApplication), mEventSourceManager(mApplication->GetJEventSourceManager())
+JThreadManager::JThreadManager(JApplication* app) 
+  : mApplication(app), mEventSourceManager(mApplication->GetJEventSourceManager()),
+    mLogger(app->GetJLogger())
 {
-	gPARMS->SetDefaultParameter("JANA:THREAD_DEBUG_LEVEL", mDebugLevel, "JThread(Manager) debug level"); //Doesn't work??
-	gPARMS->SetDefaultParameter("JANA:THREAD_ROTATE_SOURCES", mRotateEventSources, "Should threads rotate between event sources?");
-//	mDebugLevel = 500;
+
+	app->GetJParameterManager()->SetDefaultParameter(
+		"JANA:DEBUG_THREADMANAGER", 
+		mDebugLevel, 
+		"JThreadManager debug level");
+
+	app->GetJParameterManager()->SetDefaultParameter(
+		"JANA:THREAD_ROTATE_SOURCES", 
+		mRotateEventSources, 
+		"Should threads rotate between event sources?");
 
 	auto sSleepTimeNanoseconds = mSleepTime.count();
-	gPARMS->SetDefaultParameter("JANA:THREAD_SLEEP_TIME_NS", sSleepTimeNanoseconds, "Thread sleep time (in nanoseconds) when nothing to do.");
+	app->GetJParameterManager()->SetDefaultParameter(
+		"JANA:THREAD_SLEEP_TIME_NS", 
+		sSleepTimeNanoseconds, 
+		"Thread sleep time (in nanoseconds) when nothing to do.");
+
 	if(sSleepTimeNanoseconds != mSleepTime.count())
 		mSleepTime = std::chrono::nanoseconds(sSleepTimeNanoseconds);
 }
@@ -84,8 +100,9 @@ JThreadManager::~JThreadManager(void)
 {
 	EndThreads();
 	JoinThreads();
-	for(auto sThread : mThreads)
-		delete sThread;
+	for(auto p : mThreads           ) delete p;
+	for(auto p : mActiveSourceInfos ) delete p;
+	for(auto p : mRetiredSourceInfos) delete p;
 }
 
 //---------------------------------
@@ -101,6 +118,9 @@ void JThreadManager::CreateThreads(std::size_t aNumThreads)
 		auto sQueueSetIndex = si % mActiveSourceInfos.size();
 		mThreads.push_back(new JThread(si + 1, mApplication, mActiveSourceInfos[sQueueSetIndex], sQueueSetIndex, mRotateEventSources));
 	}
+
+	// Tell JApplication to adjust maximum size of JFactorySet resource pool
+	mApplication->UpdateResourceLimits();
 }
 
 //---------------------------------
@@ -122,6 +142,9 @@ void JThreadManager::AddThread(void)
 
 	//UNLOCK
 	mThreadPoolLock = false;
+
+	// Tell JApplication to adjust maximum size of JFactorySet resource pool
+	mApplication->UpdateResourceLimits();
 }
 
 //---------------------------------
@@ -143,6 +166,36 @@ void JThreadManager::RemoveThread(void)
 	sThread->End();
 	sThread->Join();
 	delete sThread;
+
+	// Tell JApplication to adjust maximum size of JFactorySet resource pool
+	mApplication->UpdateResourceLimits();
+}
+
+//---------------------------------
+// SetNJThreads
+//---------------------------------
+void JThreadManager::SetNJThreads(std::size_t nthreads)
+{
+	// Force reasonable limit to number of threads
+	if( nthreads<1 || nthreads>4096 )throw JException("nthreads (%d) out of range! must be between 1-4096", nthreads);
+
+	// Increase to desired number of threads
+	std::size_t sSourceIndex = 0;
+	while( GetNJThreads() < nthreads ) {
+		if( GetNextSourceQueues(sSourceIndex) == nullptr ) return; // Thread won't be added if this is null
+		AddThread();
+	}
+
+	// Decrease to desired number of threads
+	while( GetNJThreads() > nthreads ) {
+		RemoveThread();
+	}
+
+	// Tell JApplication to adjust maximum size of JFactorySet resource pool
+	mApplication->UpdateResourceLimits();
+
+	// Make sure all threads are running
+	RunThreads();
 }
 
 //---------------------------------
@@ -156,8 +209,8 @@ void JThreadManager::PrepareQueues(void)
 	std::vector<JEventSource*> sSources;
 	mEventSourceManager->GetActiveJEventSources(sSources);
 
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "#sources: " << sSources.size() << "\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Number of sources: " << sSources.size() << LOG_END;
+
 	for(auto sSource : sSources)
 		mActiveSourceInfos.push_back(new JEventSourceInfo(sSource, MakeQueueSet(sSource)));
 
@@ -181,11 +234,20 @@ JQueueSet* JThreadManager::MakeQueueSet(JEventSource* sEventSource)
 		//However, we can still analyze events from other sources,
 		//and don't want to block those: Separate queues
 	auto sQueueSet = mTemplateQueueSet.Clone();
+	mAllocatedQueueSets.push_back( std::shared_ptr<JQueueSet>(sQueueSet)); // ensure destructor is called later
 
 	//get source-specific event queue (e.g. disentangle events)
 	auto sEventQueue = sEventSource->GetEventQueue();
-	if(sEventQueue == nullptr) //unspecified by source, use default
-		sEventQueue = new JQueue("Events");
+	if(sEventQueue == nullptr){
+		//unspecified by source, use default
+		sEventQueue = new JQueueSimple(mApplication->GetJParameterManager(), 
+				               "Events");
+	}
+
+	// This will add the queue used by the JEventSource to output completed
+	// (parsed) events. The source may use other queues internally ahead of
+	// this one. n.b. JANA will place events obtained from the source via
+	// GetEvent into the first "Events" type queue in the set.
 	sQueueSet->AddQueue(JQueueSet::JQueueType::Events, sEventQueue);
 
 	return sQueueSet;
@@ -236,7 +298,7 @@ void JThreadManager::LockThreadPool(void) const
 //---------------------------------
 // GetQueue
 //---------------------------------
-JQueueInterface* JThreadManager::GetQueue(const std::shared_ptr<JTaskBase>& aTask, JQueueSet::JQueueType aQueueType, const std::string& aQueueName) const
+JQueue* JThreadManager::GetQueue(const std::shared_ptr<JTaskBase>& aTask, JQueueSet::JQueueType aQueueType, const std::string& aQueueName) const
 {
 	auto sEventSource = aTask->GetEvent()->GetEventSource();
 	return GetQueue(sEventSource, aQueueType, aQueueName);
@@ -245,7 +307,7 @@ JQueueInterface* JThreadManager::GetQueue(const std::shared_ptr<JTaskBase>& aTas
 //---------------------------------
 // GetQueue
 //---------------------------------
-JQueueInterface* JThreadManager::GetQueue(const JEventSource* aEventSource, JQueueSet::JQueueType aQueueType, const std::string& aQueueName) const
+JQueue* JThreadManager::GetQueue(const JEventSource* aEventSource, JQueueSet::JQueueType aQueueType, const std::string& aQueueName) const
 {
 	auto sQueueSet = GetEventSourceInfo(aEventSource)->mQueueSet;
 	return sQueueSet->GetQueue(aQueueType, aQueueName);
@@ -284,9 +346,9 @@ void JThreadManager::GetActiveSourceInfos(std::vector<JEventSourceInfo*>& aSourc
 }
 
 //---------------------------------
-// SetQueue
+// AddQueue
 //---------------------------------
-void JThreadManager::AddQueue(JQueueSet::JQueueType aQueueType, JQueueInterface* aQueue)
+void JThreadManager::AddQueue(JQueueSet::JQueueType aQueueType, JQueue* aQueue)
 {
 	//Set a template queue that will be used (cloned) for each event source.
 	//Doesn't lock: Assumes no one is crazy enough to call this while in the middle of running.
@@ -371,8 +433,10 @@ JThreadManager::JEventSourceInfo* JThreadManager::RegisterSourceFinished(const J
 	JEventSource::RETURN_STATUS sStatus = JEventSource::RETURN_STATUS::kUNKNOWN;
 	JEventSource* sNextSource = nullptr;
 	std::tie(sStatus, sNextSource) = mEventSourceManager->OpenNext(aFinishedEventSource);
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::RegisterSourceFinished(): Source finished, next source = " << sNextSource << "\n" << JLogEnd();
+
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() 
+		<< " JThreadManager::RegisterSourceFinished(): Source finished, next source = " 
+		<< sNextSource << LOG_END;
 
 	//LOCK
 	LockScourceInfos();
@@ -380,8 +444,8 @@ JThreadManager::JEventSourceInfo* JThreadManager::RegisterSourceFinished(const J
 	if(sNextSource != nullptr)
 	{
 		//We have just opened a new event source
-		if(mDebugLevel > 0)
-			JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::RegisterSourceFinished(): New source opened\n" << JLogEnd();
+		LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() 
+			<< " JThreadManager::RegisterSourceFinished(): New source opened" << LOG_END;
 
 		//Retire the current queue set, insert a new one in its place
 		mActiveSourceInfos[aQueueSetIndex]->mQueueSet->FinishedWithQueues();
@@ -406,8 +470,8 @@ JThreadManager::JEventSourceInfo* JThreadManager::RegisterSourceFinished(const J
 		if(sInfo != nullptr)
 		{
 			//Another thread opened a new source, and installed it into mActiveQueueSets at the same slot
-			if(mDebugLevel > 0)
-				JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::RegisterSourceFinished(): Another thread opened a new source\n" << JLogEnd();
+			LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() 
+				<< " JThreadManager::RegisterSourceFinished(): Another thread opened a new source" << LOG_END;
 
 			//Get and return the new queue set and source (don't forget to unlock!)
 			mScourceInfosLock = false;
@@ -422,8 +486,8 @@ JThreadManager::JEventSourceInfo* JThreadManager::RegisterSourceFinished(const J
 	}
 
 	//We removed the previous source from the active list (first one to get there), and there are no new sources to open
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::RegisterSourceFinished(): No new sources to open\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() 
+		<< " JThreadManager::RegisterSourceFinished(): No new sources to open" << LOG_END;
 
 	//Retire the current source info and remove it from the active queue
 	//Note that we can't actually erase it: It would invalidate the queue set indices of other threads
@@ -454,8 +518,8 @@ JThreadManager::JEventSourceInfo* JThreadManager::CheckAllSourcesDone(std::size_
 	if(std::all_of(std::begin(mActiveSourceInfos), std::end(mActiveSourceInfos), sNullChecker))
 	{
 		//The last event source is done.
-		if(mDebugLevel > 0)
-			JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::CheckAllSourcesDone(): All tasks from all event sources are done\n" << JLogEnd();
+		LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() 
+			<< " JThreadManager::CheckAllSourcesDone(): All tasks from all event sources are done" << LOG_END;
 
 		//UNLOCK
 		mScourceInfosLock = false;
@@ -491,23 +555,27 @@ void JThreadManager::ExecuteTask(const std::shared_ptr<JTaskBase>& aTask, JEvent
 	if(aQueueType == JQueueSet::JQueueType::Events)
 		PrepareEventTask(aTask, aSourceInfo);
 
-	try
-	{
-		(*aTask)(); //Execute task
-	}
-	catch(...)
-	{
+	try{
+		//Execute task
+		(*aTask)();
+		LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::ExecuteTask(): Task executed successfully." << LOG_END;
+
+		// Release the JEvent
+		if(aQueueType == JQueueSet::JQueueType::Events){
+			auto sEvent = const_cast<JEvent*>(aTask->GetEvent());
+			sEvent->Release();
+		}
+
+	}catch(...){
 		//Catch the exception
+
 		auto sException = std::current_exception();
 
-		if(mDebugLevel > 0)
-			JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::ExecuteTask(): Caught exception!\n" << JLogEnd();
+		LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::ExecuteTask(): Caught exception!" << LOG_END;
 
 		//Rethrow the exception
 		std::rethrow_exception(sException);
 	}
-	if(mDebugLevel >= 10)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::ExecuteTask(): Task executed successfully.\n" << JLogEnd();
 }
 
 //---------------------------------
@@ -551,8 +619,9 @@ void JThreadManager::SubmitAsyncTasks(const std::vector<std::shared_ptr<JTaskBas
 	//Function returns as soon as all tasks are submitted; it doesn't wait until all tasks are finished.
 	//Function ASSUMES all tasks from the same event source!!!
 
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::SubmitAsyncTasks(): Submit " << aTasks.size() << " tasks.\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() 
+		<< " JThreadManager::SubmitAsyncTasks(): Submit " 
+		<< aTasks.size() << " tasks." << LOG_END;
 
 	if(aTasks.empty())
 		return;
@@ -575,9 +644,11 @@ void JThreadManager::SubmitTasks(const std::vector<std::shared_ptr<JTaskBase>>& 
 	//Tasks are added to the specified queue.
 	//Function does not return until all tasks are finished.
 	//Function ASSUMES all tasks from the same event source!!!
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::SubmitTasks(): Submit " << aTasks.size() <<
-		" tasks to queue type " << static_cast<std::underlying_type<JQueueSet::JQueueType>::type>(aQueueType) << ", name = " << aQueueName << ".\n" << JLogEnd();
+	
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() 
+		<< " JThreadManager::SubmitTasks(): Submit " << aTasks.size() << " tasks to queue type " 
+		<< static_cast<std::underlying_type<JQueueSet::JQueueType>::type>(aQueueType) 
+		<< ", name = " << aQueueName << LOG_END;
 
 	if(aTasks.empty())
 		return;
@@ -598,7 +669,7 @@ void JThreadManager::SubmitTasks(const std::vector<std::shared_ptr<JTaskBase>>& 
 //---------------------------------
 // SubmitTasks
 //---------------------------------
-void JThreadManager::SubmitTasks(const std::vector<std::shared_ptr<JTaskBase>>& aTasks, JEventSourceInfo* aSourceInfo, JQueueInterface* aQueue, JQueueSet::JQueueType aQueueType)
+void JThreadManager::SubmitTasks(const std::vector<std::shared_ptr<JTaskBase>>& aTasks, JEventSourceInfo* aSourceInfo, JQueue* aQueue, JQueueSet::JQueueType aQueueType)
 {
 	//You would think submitting tasks would be easy.
 	//However, the task JQueue can fill up, and we may not be able to put all of our tasks in.
@@ -613,7 +684,7 @@ void JThreadManager::SubmitTasks(const std::vector<std::shared_ptr<JTaskBase>>& 
 	while(sIterator != sEnd)
 	{
 		//Try to submit task
-		if(aQueue->AddTask(*sIterator) != JQueueInterface::Flags_t::kNO_ERROR)
+		if(aQueue->AddTask(*sIterator) != JQueue::Flags_t::kNO_ERROR)
 		{
 			//Failed (queue probably full): Execute a task in the meantime
 			ExecuteTask(*sIterator, aSourceInfo, aQueueType);
@@ -621,8 +692,7 @@ void JThreadManager::SubmitTasks(const std::vector<std::shared_ptr<JTaskBase>>& 
 		sIterator++; //advance to the next task
 	}
 
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::SubmitTasks(): Tasks submitted.\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::SubmitTasks(): Tasks submitted." << LOG_END;
 }
 
 //---------------------------------
@@ -674,7 +744,7 @@ void JThreadManager::DoWorkWhileWaitingForTasks(const std::vector<std::shared_pt
 //---------------------------------
 // DoWorkWhileWaitingForTasks
 //---------------------------------
-void JThreadManager::DoWorkWhileWaitingForTasks(const std::vector<std::shared_ptr<JTaskBase>>& aSubmittedTasks, JEventSourceInfo* aSourceInfo, JQueueInterface* aQueue, JQueueSet::JQueueType aQueueType)
+void JThreadManager::DoWorkWhileWaitingForTasks(const std::vector<std::shared_ptr<JTaskBase>>& aSubmittedTasks, JEventSourceInfo* aSourceInfo, JQueue* aQueue, JQueueSet::JQueueType aQueueType)
 {
 	//The passed-in tasks have already been submitted (e.g. via SubmitTasks or SubmitAsyncTasks).
 	//While waiting for those to finish, we get tasks from the queues and execute those.
@@ -698,12 +768,11 @@ void JThreadManager::DoWorkWhileWaitingForTasks(const std::vector<std::shared_pt
 //---------------------------------
 // DoWorkWhileWaitingForTasks
 //---------------------------------
-void JThreadManager::DoWorkWhileWaitingForTasks(const std::function<bool(void)>& aWaitFunction, JEventSourceInfo* aSourceInfo, JQueueInterface* aQueue, JQueueSet::JQueueType aQueueType)
+void JThreadManager::DoWorkWhileWaitingForTasks(const std::function<bool(void)>& aWaitFunction, JEventSourceInfo* aSourceInfo, JQueue* aQueue, JQueueSet::JQueueType aQueueType)
 {
 	//Won't return until aWaitFunction returns true.
 	//In the meantime, executes tasks (or sleeps if none available)
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::DoWorkWhileWaitingForTasks()\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::DoWorkWhileWaitingForTasks()" << LOG_END;
 
 	while(aWaitFunction())
 	{
@@ -717,14 +786,13 @@ void JThreadManager::DoWorkWhileWaitingForTasks(const std::function<bool(void)>&
 			std::this_thread::sleep_for(mSleepTime); //Sleep a minimal amount.
 	}
 
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::DoWorkWhileWaitingForTasks(): Done waiting.\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::DoWorkWhileWaitingForTasks(): Done waiting." << LOG_END;
 }
 
 //---------------------------------
 // GetTask
 //---------------------------------
-std::pair<JQueueSet::JQueueType, std::shared_ptr<JTaskBase>> JThreadManager::GetTask(JQueueSet* aQueueSet, JQueueInterface* aQueue, JQueueSet::JQueueType aQueueType) const
+std::pair<JQueueSet::JQueueType, std::shared_ptr<JTaskBase>> JThreadManager::GetTask(JQueueSet* aQueueSet, JQueue* aQueue, JQueueSet::JQueueType aQueueType) const
 {
 	//This is called by threads who have just submitted (or are waiting on) tasks to complete,
 	//and want work to do in the meantime.
@@ -737,8 +805,7 @@ std::pair<JQueueSet::JQueueType, std::shared_ptr<JTaskBase>> JThreadManager::Get
 	if(sTask != nullptr)
 		return std::make_pair(aQueueType, sTask);
 
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::GetTask(): Queue empty.\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::GetTask(): Queue empty." << LOG_END;
 
 	//Next, prefer executing tasks from the same event source (input queue set)
 	JQueueSet::JQueueType sQueueType;
@@ -746,8 +813,7 @@ std::pair<JQueueSet::JQueueType, std::shared_ptr<JTaskBase>> JThreadManager::Get
 	if(sTask != nullptr)
 		return std::make_pair(sQueueType, sTask);
 
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::GetTask(): Event source tasks empty.\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::GetTask(): Event source tasks empty." << LOG_END;
 
 	//Finally, loop over all active queue sets (different event sources)
 	LockScourceInfos();
@@ -766,8 +832,7 @@ std::pair<JQueueSet::JQueueType, std::shared_ptr<JTaskBase>> JThreadManager::Get
 		}
 	}
 
-	if(mDebugLevel > 0)
-		JLog(mLogTarget) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::GetTask(): No tasks.\n" << JLogEnd();
+	LOG_TRACE(mLogger, mDebugLevel) << "Thread " << JTHREAD->GetThreadID() << " JThreadManager::GetTask(): No tasks." << LOG_END;
 
 	//No tasks in any queues, return nullptr
 	mScourceInfosLock = false; //UNLOCK
@@ -792,23 +857,20 @@ void JThreadManager::SetThreadAffinity(int affinity_algorithm)
 
 	// The default algorithm does not set the affinity at all
 	if( affinity_algorithm==0 ){
-		if(mDebugLevel > 0)
-			JLog(mLogTarget) << "JThreadManager::SetThreadAffinity(): Thread affinity not set.\n" << JLogEnd();
+		LOG_TRACE(mLogger, mDebugLevel) << "JThreadManager::SetThreadAffinity(): Thread affinity not set." << LOG_END;
 		return;
 	}
 
 	if( typeid(std::thread::native_handle_type) != typeid(pthread_t) ){
-		JLog(mLogTarget) << "\n";
-		JLog(mLogTarget) << "WARNING: AFFINITY is set, but thread system is not pthreads.\n";
-		JLog(mLogTarget) << "         Thread affinity will not be set by JANA.\n";
-		JLog(mLogTarget) << "\n" << JLogEnd();
+		LOG_WARN(mLogger) << "AFFINITY is set, but thread system is not pthreads." << LOG_END;
+		LOG_WARN(mLogger) << "  Thread affinity will not be set by JANA." << LOG_END;
 		return;
 	}
 
-	JLog(mLogTarget) << "JThreadManager::SetThreadAffinity(): Setting affinity for all threads using algorithm " << affinity_algorithm << "\n" << JLogEnd();
+	LOG_TRACE(mLogger, mLogTarget) << "JThreadManager::SetThreadAffinity(): Setting affinity for all threads using algorithm " << affinity_algorithm << LOG_END;
 
 	uint32_t ithread = 0;
-	uint32_t ncores = GetNcores();
+	uint32_t ncores = JCpuInfo::GetNumCpus();
 	for( auto jt : mThreads ){
 		pthread_t t = jt->GetThread()->native_handle();
 
@@ -831,7 +893,7 @@ void JThreadManager::SetThreadAffinity(int affinity_algorithm)
 				icpu %= ncores;
 				break;
 			default:
-				JLog(1) << "Unknown affinity algorithm " << affinity_algorithm << "\n" << JLogEnd(); //1: std::cerr
+				LOG_FATAL(mLogger) << "Unknown affinity algorithm " << affinity_algorithm << LOG_END;
 				exit( -1 );
 				break;
 		}
@@ -839,41 +901,69 @@ void JThreadManager::SetThreadAffinity(int affinity_algorithm)
 
 #ifdef __APPLE__
 		// Mac OS X
-		thread_affinity_policy_data_t policy = { (int)icpu };
-		thread_port_t mach_thread = pthread_mach_thread_np( t );
-		thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
-		_DBG_<<"CPU: " << mApplication->GetCPU() << "  (mach_thread="<<mach_thread<<", icpu=" << icpu <<")" << std::endl;
+		thread_affinity_policy_data_t policy = { (int) icpu };
+		thread_port_t mach_thread = pthread_mach_thread_np(t);
+		thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, 
+				  (thread_policy_t)&policy, 
+				  THREAD_AFFINITY_POLICY_COUNT);
+
+		LOG_DEBUG(mLogger) << "CPU=" << JCpuInfo::GetCpuID()
+			           << " (mach_thread="<< mach_thread
+				   << ", icpu=" << icpu << ")" << LOG_END;
 #else
 		// Linux
 		cpu_set_t cpuset;
-    	CPU_ZERO(&cpuset);
-    	CPU_SET( icpu, &cpuset);
-    	int rc = pthread_setaffinity_np( t, sizeof(cpu_set_t), &cpuset);
-		if( rc !=0 )
-			JLog(1) << "ERROR: pthread_setaffinity_np returned " << rc << " for thread " << ithread << "\n" << JLogEnd(); //1: std::cerr
+    		CPU_ZERO(&cpuset);
+    		CPU_SET(icpu, &cpuset);
+    		int rc = pthread_setaffinity_np(t, sizeof(cpu_set_t), &cpuset);
+		if (rc != 0) {
+			LOG_ERROR(mLogger) << "pthread_setaffinity_np returned " 
+				           << rc << " for thread " << ithread 
+					   << LOG_END;
+		}
+
 #endif
 	}
 }
-
-//---------------------------------
-// GetNcores
-//---------------------------------
-uint32_t JThreadManager::GetNcores(void)
-{
-	/// Returns the number of cores that are on the computer.
-	/// The count will be full cores+hyperthreads (or equivalent)
-
-	return sysconf(_SC_NPROCESSORS_ONLN);
-}
-
 
 //---------------------------------
 // RunThreads
 //---------------------------------
 void JThreadManager::RunThreads(void)
 {
-	for(auto sThread : mThreads)
-		sThread->Run();
+	/// Tell all threads to enter the running state. This is called from JApplication::Run
+	/// after the threads have been created and it is ready to proceed with data processing.
+	/// It may also be called to resume data processing after a call to StopThreads() has
+	/// paused it.
+
+	for(auto sThread : mThreads) sThread->Run();
+}
+
+//---------------------------------
+// StopThreads
+//---------------------------------
+void JThreadManager::StopThreads(bool wait_until_idle)
+{
+	/// Stop all threads from processing. This will allow the threads to complete
+	/// their current task before dropping into the idle state. This will call
+	/// the Stop() method for all JThread objects.
+	///
+	/// Note that JThread::Stop() will be called with no arguments first which should
+	/// flag the thread to stop, but return right away. If the wait_until_idle flag
+	/// is set, then this will call JThread::Stop a second time, passing an argument
+	/// of "true" which will block until the thread is in the idle state. By calling
+	/// the Stop method twice, it will more quickly get to the state where all threads
+	/// are idle.
+	///
+	/// Note also that if RunThreads() is called (or JThread::Run()) before a thread has
+	/// gone into the idle state then that will effectively cancel this call and it may
+	/// return with one of more threads never having gone into the idle state. In other
+	/// words, calling this with wait_until_idle==true does no necessarily guarrantee that
+	/// all threads are idle upon return.
+
+	for(auto sThread : mThreads) sThread->Stop();
+	
+	if( wait_until_idle ) for(auto sThread : mThreads) sThread->Stop( true );
 }
 
 //---------------------------------
@@ -896,10 +986,56 @@ void JThreadManager::JoinThreads(void)
 }
 
 //---------------------------------
-// JoinThreads
+// AreAllThreadsIdle
 //---------------------------------
-bool JThreadManager::HaveAllThreadsEnded(void)
+bool JThreadManager::AreAllThreadsIdle(void)
 {
+	/// Returns true if all JThread objects are currently in the idle state.
+	auto sEndChecker = [](JThread* aThread) -> bool {return aThread->IsIdle();};
+	return std::all_of(std::begin(mThreads), std::end(mThreads), sEndChecker);
+}
+
+//---------------------------------
+// AreAllThreadsRunning
+//---------------------------------
+bool JThreadManager::AreAllThreadsRunning(void)
+{
+	/// Returns true if all JThread objects are currently in the running state.
+	auto sEndChecker = [](JThread* aThread) -> bool {return aThread->IsRunning();};
+	return std::all_of(std::begin(mThreads), std::end(mThreads), sEndChecker);
+}
+
+//---------------------------------
+// AreAllThreadsEnded
+//---------------------------------
+bool JThreadManager::AreAllThreadsEnded(void)
+{
+	/// Returns true if all JThread objects are currently in the ended state.
 	auto sEndChecker = [](JThread* aThread) -> bool {return aThread->IsEnded();};
 	return std::all_of(std::begin(mThreads), std::end(mThreads), sEndChecker);
+}
+
+//---------------------------------
+// WaitUntilAllThreadsIdle
+//---------------------------------
+void JThreadManager::WaitUntilAllThreadsIdle(void)
+{
+	/// This is equivalent to calling StopThreads(true).
+	StopThreads( true );
+}
+
+//---------------------------------
+// WaitUntilAllThreadsRunning
+//---------------------------------
+void JThreadManager::WaitUntilAllThreadsRunning(void)
+{
+	while( !AreAllThreadsRunning() ) std::this_thread::sleep_for( std::chrono::milliseconds(100) );
+}
+
+//---------------------------------
+// WaitUntilAllThreadsEnded
+//---------------------------------
+void JThreadManager::WaitUntilAllThreadsEnded(void)
+{
+	while( !AreAllThreadsEnded() ) std::this_thread::sleep_for( std::chrono::milliseconds(100) );
 }

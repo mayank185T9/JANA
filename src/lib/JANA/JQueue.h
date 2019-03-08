@@ -45,50 +45,60 @@
 #define _JQueue_h_
 
 #include <cstdint>
-#include <atomic>
-#include <vector>
+#include <string>
+#include <memory>
 
-#include "JQueueInterface.h"
+class JTaskBase;
 
-class JQueue : public JQueueInterface
+class JQueue
 {
 	public:
 	
-		JQueue(const std::string& aName, std::size_t aQueueSize = 200, std::size_t aTaskBufferSize = 0);
+		enum class Flags_t {
+			kNone,
+			kQUEUE_FULL,
+			kNO_ERROR
+		};
 
-		//COPIERS //needed because atomic not copyable
-		JQueue(const JQueue& aQueue);
-		JQueue& operator=(const JQueue& aQueue);
+		//STRUCTORS
+		JQueue(const std::string& aName);
+		virtual ~JQueue() = default;
 
-		//MOVERS //specify because deleted by default if copiers specified
+		//COPIERS //needed because movers specified
+		JQueue(const JQueue& aQueue) = default;
+		JQueue& operator=(const JQueue& aQueue) = default;
+
+		//MOVERS //needed because destructor specified
 		JQueue(JQueue&&) = default;
 		JQueue& operator=(JQueue&&) = default;
 
-		Flags_t AddTask(const std::shared_ptr<JTaskBase>& aTask);
-		Flags_t AddTask(std::shared_ptr<JTaskBase>&& aTask);
-		std::shared_ptr<JTaskBase> GetTask(void);
-		bool AreEnoughTasksBuffered(void);
+		virtual Flags_t AddTask(const std::shared_ptr<JTaskBase>& aTask) = 0;
+		virtual Flags_t AddTask(std::shared_ptr<JTaskBase>&& aTask) = 0;
+		virtual void AddTasksProcessedOutsideQueue(std::size_t nTasks) {}
+		virtual std::shared_ptr<JTaskBase> GetTask(void) = 0;
+		virtual bool AreEnoughTasksBuffered(void){return true;} //Only used for the event queue
 
-		uint32_t GetMaxTasks(void);
-		uint32_t GetNumTasks(void);
-		uint64_t GetNumTasksProcessed(void);
-		std::size_t GetTaskBufferSize(void);
-	
-		JQueueInterface* CloneEmpty(void) const;
+		virtual uint32_t GetMaxTasks(void) = 0;
+		virtual uint32_t GetNumTasks(void) = 0;
+		virtual uint64_t GetNumTasksInserted(void){ return 0.0;}
+		virtual uint64_t GetNumTasksProcessed(void) = 0;
+		virtual std::size_t GetTaskBufferSize(void) = 0;
+		virtual std::size_t GetLatestBarrierEventUseCount(void) const{return 0;}
+
+		virtual void FinishedWithQueue(void){} //Call this when finished with the queue
+
+		std::string GetName(void) const;
+		virtual JQueue* CloneEmpty(void) const = 0; //Create an empty clone of the queue (no tasks copied)
 
 	private:
-
-		std::size_t mTaskBufferSize = 0; //min event task buffer (only checked for Events queue) //will get more events if # tasks < this
-		int mDebugLevel = 0;
-		uint32_t mLogTarget = 0; //cout
-
-		std::vector<std::shared_ptr<JTaskBase>> mQueue;
-		std::atomic<uint64_t> mTasksProcessed{0};
-
-		std::atomic<uint32_t> iread{0};		//The slot that the next thread will try to read from
-		std::atomic<uint32_t> iwrite{0};	//The slot that the next thread will try to write to
-		std::atomic<uint32_t> ibegin{0};	//The slot indicating the beginning of the read region //is separate from iread in order to get exclusive access to iread
-		std::atomic<uint32_t> iend{0};		//The slot indicating one-past-the-end of the read region
+		std::string mName;
 };
+
+inline JQueue::JQueue(const std::string& aName) : mName(aName) { }
+
+inline std::string JQueue::GetName(void) const
+{
+	return mName;
+}
 
 #endif // _JQueue_h_

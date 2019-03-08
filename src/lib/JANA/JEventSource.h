@@ -41,8 +41,6 @@
 //
 //
 //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
-#ifndef _JEventSource_h_
-#define _JEventSource_h_
 
 #include <string>
 #include <utility>
@@ -51,20 +49,29 @@
 #include <vector>
 #include <typeindex>
 
+#include <JANA/JApplication.h>
+#include <JANA/JFactoryGenerator.h>
+
 class JTaskBase;
-class JApplication;
-class JQueueInterface;
+class JQueue;
 class JEvent;
-class JFactoryBase;
-class JFactoryGenerator;
+class JEventSourceManager;
+class JEventSourceGenerator;
+class JFactory;
+template<typename T> class JFactoryT;
 
 //Deriving classes should:
 //Overload all virtual methods (as needed)
-//Create their own JFactoryGenerator and JQueueInterface and store in the member variables (as needed)
+//Create their own JFactoryGenerator and JQueue and store in the member variables (as needed)
+
+#ifndef _JEventSource_h_
+#define _JEventSource_h_
 
 class JEventSource{
 
 	friend JEvent;
+	friend JEventSourceManager;
+	friend JEventSourceGenerator;
 
 	public:
 	
@@ -73,36 +80,47 @@ class JEventSource{
 			kNO_MORE_EVENTS,
 			kBUSY,
 			kTRY_AGAIN,
+			kERROR,
 			kUNKNOWN
 		};
 
-		JEventSource(std::string name, JApplication* aApplication);
+		JEventSource(std::string name, JApplication* aApplication=nullptr);
 		virtual ~JEventSource();
 		
 		virtual void Open(void);
-		virtual bool GetObjects(const std::shared_ptr<const JEvent>& aEvent, JFactoryBase* aFactory){return false;}
+		virtual bool GetObjects(const std::shared_ptr<const JEvent>& aEvent, JFactory* aFactory){return false;}
 
 		void SetNumEventsToGetAtOnce(std::size_t aMinNumEvents, std::size_t aMaxNumEvents);
 		std::pair<std::size_t, std::size_t> GetNumEventsToGetAtOnce(void) const; //returns min, max
 
-		std::pair<std::vector<std::shared_ptr<JTaskBase>>, JEventSource::RETURN_STATUS> GetProcessEventTasks(std::size_t aNumTasks = 1);
-		bool IsFileClosed(void) const;
-		std::size_t GetNumEventsProcessed(void) const{return mEventsProcessed;}
+		std::vector<std::shared_ptr<JTaskBase> > GetProcessEventTasks(std::size_t aNumTasks = 1);
+		bool IsExhausted(void) const;
+		std::size_t GetNumEventsProcessed(void) const;
 		
+		virtual std::string GetType(void) const; ///< Returns name of subclass
+		virtual std::string GetVDescription(void) const {return "<description unavailable>";} ///< Optional for getting description via source rather than JEventSourceGenerator
+
 		std::string GetName(void) const{return mName;}
 		std::size_t GetNumOutstandingEvents(void) const{return mNumOutstandingEvents;}
 		std::size_t GetNumOutstandingBarrierEvents(void) const{return mNumOutstandingBarrierEvents;}
 
-		JQueueInterface* GetEventQueue(void) const{return mEventQueue;}
+		JQueue* GetEventQueue(void) const{return mEventQueue;}
 		JFactoryGenerator* GetFactoryGenerator(void) const{return mFactoryGenerator;}
-		virtual std::type_index GetDerivedType(void) const = 0; //So that we only execute factory generator once per type
-		
+		std::type_index GetDerivedType(void) const {return std::type_index(typeid(*this));}
+
+		void SetMaxEventsToRead(std::size_t aMaxEventsToRead){mMaxEventsToRead = aMaxEventsToRead;}
+		std::size_t GetMaxEventsToRead(void){return mMaxEventsToRead;}
+
+		std::atomic<std::size_t> mEventsRead{0};
+		std::atomic<std::size_t> mTasksCreated{0};
+
 	protected:
 	
-		virtual std::pair<std::shared_ptr<const JEvent>, RETURN_STATUS> GetEvent(void) = 0;
+		void SetJApplication(JApplication *app);
+		virtual std::shared_ptr<const JEvent> GetEvent(void) = 0;
 		JApplication* mApplication = nullptr;
 		std::string mName;
-		JQueueInterface* mEventQueue = nullptr; //For handling event-source-specific logic (such as disentangling events, dealing with barriers, etc.)
+		JQueue* mEventQueue = nullptr; //For handling event-source-specific logic (such as disentangling events, dealing with barriers, etc.)
 		JFactoryGenerator* mFactoryGenerator = nullptr; //This should create default factories for all types available in the event source
 
 	private:
@@ -116,14 +134,16 @@ class JEventSource{
 		virtual std::shared_ptr<JTaskBase> GetProcessEventTask(std::shared_ptr<const JEvent>&& aEvent);
 
 		//Keep track of file/event status
-		std::atomic<bool> mFileClosed{false};
+		std::atomic<bool> mExhausted{false};
 		std::atomic<bool> mGettingEvent{false};
 		std::atomic<std::size_t> mEventsProcessed{0};
 		std::atomic<std::size_t> mNumOutstandingEvents{0}; //Number of JEvents still be analyzed from this event source (source done when 0 (OR 1 and below is 1))
 		std::atomic<std::size_t> mNumOutstandingBarrierEvents{0}; //Number of BARRIER JEvents still be analyzed from this event source (source done when 1)
 
+
 		std::size_t mMinNumEventsToGetAtOnce = 1;
 		std::size_t mMaxNumEventsToGetAtOnce = 1;
+		std::size_t mMaxEventsToRead = 0;
 };
 
 #endif // _JEventSource_h_

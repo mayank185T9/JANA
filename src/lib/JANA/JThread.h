@@ -53,8 +53,7 @@
 class JEventSource;
 class JApplication;
 class JQueueSet;
-class JQueueInterface;
-class JLog;
+class JQueue;
 
 class JThread{
 	public:
@@ -77,6 +76,7 @@ class JThread{
 		void Join(void);
 
 		void End(void);
+		bool IsRunning(void);
 		bool IsIdle(void);
 		bool IsEnded(void);
 		bool IsJoined(void);
@@ -92,7 +92,7 @@ class JThread{
 		JThreadManager::JEventSourceInfo* mEventSourceInfo = nullptr;
 		std::size_t mQueueSetIndex = 0;
 
-		JQueueInterface* mEventQueue = nullptr;
+		JQueue* mEventQueue = nullptr;
 		bool mRotateEventSources = false;
 		bool mSourceEmpty = false;
 		std::size_t mFullRotationCheckIndex = 0; //For detecting when we are simply rotating and not executing

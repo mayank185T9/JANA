@@ -37,6 +37,8 @@
 // POSSIBILITY OF SUCH DAMAGE.
 //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
+#include <cxxabi.h>
+
 #include "JEventSource.h"
 #include "JFunctions.h"
 #include "JApplication.h"
@@ -47,11 +49,12 @@
 //---------------------------------
 JEventSource::JEventSource(string name, JApplication* aApplication) : mApplication(aApplication), mName(name)
 {
-	//Do not open the source here!
-	//It will be opened in the Open() method
-
-	//Create JEventQueue here!
-	//Create JFactoryGenerator here! (for all types in the files)
+	/// Do not open the source here!
+	/// It will be opened in the Open() method
+	///
+	/// If anything more than the default JEventQueue structure is needed then create it here.
+	/// You may also add JFactoryGenerator objects to the JApplication to generate factories
+	/// for holding object types created by this source.
 }
 
 //---------------------------------
@@ -71,39 +74,101 @@ void JEventSource::Open(void)
 }
 
 //---------------------------------
-// GetProcessEventTask
+// SetJApplication
 //---------------------------------
-std::pair<std::vector<std::shared_ptr<JTaskBase>>, JEventSource::RETURN_STATUS> JEventSource::GetProcessEventTasks(std::size_t aNumTasks)
+void JEventSource::SetJApplication(JApplication *app)
 {
-	//This version is called by JThread
+	mApplication = app;
+}
+
+//---------------------------------
+// GetNumEventsProcessed
+//---------------------------------
+std::size_t JEventSource::GetNumEventsProcessed(void) const
+{
+	/// Return total number of events processed by this source.
+	/// This is a little tricky. A source may consist of multiple
+	/// queues that expand one "event" into many. This returns
+	/// the count returned by the GetNumEventsProcessed() of the
+	/// queue pointed to by the mEventQueue member of this source
+	/// if it is set. This presumably is the last queue in the
+	/// chain and what the caller is most interested in. If that
+	/// is not set, then the value of the member mEventsProcessed
+	/// is returned. This is a count of the number of events
+	/// processed through all queues, including any internal ones.
+	/// In those situations, this will likely be double counting.
+	///
+	/// Note that in the first case, the number is how many events
+	/// were removed from the last queue, but some of those may
+	/// still be processing. Thus, it might overcount how many were
+	/// actually completed. This is only a problem if this is called
+	/// while event processing is still ongoing.
+	if( mEventQueue != nullptr ) return mEventQueue->GetNumTasksProcessed();
+
+	return mEventsProcessed;
+}
+
+//---------------------------------
+// GetType
+//---------------------------------
+std::string JEventSource::GetType(void) const
+{
+	return GetDemangledName<decltype(*this)>();
+}
+
+//---------------------------------
+// GetProcessEventTasks
+//---------------------------------
+std::vector<std::shared_ptr<JTaskBase> > JEventSource::GetProcessEventTasks(std::size_t aNumTasks)
+{
+	/// This version is called by JThread.
+	/// This will attempt to read aNumTasks from the source, wrapping each in a JTask
+	/// so it can be added to this source's Event queue.
 
 	//If file closed, return dummy pair
-	if(mFileClosed)
-		return std::make_pair(std::vector<std::shared_ptr<JTaskBase>>(), RETURN_STATUS::kNO_MORE_EVENTS);
+	if(mExhausted) return std::vector<std::shared_ptr<JTaskBase>>();
+
+	// Optionally limit number of events read from this source
+	if( (mMaxEventsToRead!=0) && ((mEventsRead + aNumTasks)>mMaxEventsToRead) ){
+		aNumTasks = mMaxEventsToRead - mEventsRead;
+	}
 
 	//Initialize things before locking
 	std::vector<std::shared_ptr<const JEvent>> sEvents;
 	sEvents.reserve(aNumTasks);
-	auto sFailureStatus = JEventSource::RETURN_STATUS::kSUCCESS;
 
 	//Attempt to acquire atomic lock
 	bool sExpected = false;
-	if(!mGettingEvent.compare_exchange_strong(sExpected, true)) //failed, return busy
-		return std::make_pair(std::vector<std::shared_ptr<JTaskBase>>(), RETURN_STATUS::kBUSY);
+	if(!mGettingEvent.compare_exchange_strong(sExpected, true)){
+		// failed to get lock. Return empty container
+		return std::vector<std::shared_ptr<JTaskBase> >();
+	}
 
 	//Lock aquired, get the events
 	for(std::size_t si = 0; si < aNumTasks; si++)
 	{
-		//Get an event from the input file
-		auto sEventPair = GetEvent();
-
-		//Save the event if we succeeded
-		if(sEventPair.first != nullptr)
-			sEvents.push_back(std::move(sEventPair.first));
-		else //Break if there's an issue
-		{
-			sFailureStatus = sEventPair.second;
-			break;
+		// Read an event from the source. Anything other than a successful read
+		// throws an exception (we never need to check for kSUCCESS)
+		try{
+			std::shared_ptr<const JEvent> jevent = GetEvent();
+			std::const_pointer_cast<JEvent>(jevent)->SetJEventSource(this);         // don't tell the C++ police!
+			std::const_pointer_cast<JEvent>(jevent)->SetJApplication(mApplication); // don't tell the C++ police!
+			sEvents.push_back(std::move(jevent));
+		}catch(RETURN_STATUS ret_status){
+			switch(ret_status){
+				case RETURN_STATUS::kNO_MORE_EVENTS:
+				case RETURN_STATUS::kERROR:
+					mExhausted = true;
+					break;
+				case RETURN_STATUS::kBUSY:
+				case RETURN_STATUS::kTRY_AGAIN:
+				default:
+					break;
+			}
+			break; // exception caught so don't try reading any more events right now
+		}catch(...){
+			mExhausted = true;
+			break; // un-expected exception caught
 		}
 	}
 
@@ -111,14 +176,11 @@ std::pair<std::vector<std::shared_ptr<JTaskBase>>, JEventSource::RETURN_STATUS> 
 	mGettingEvent = false;
 
 	//Make tasks for analyzing the events
-	std::pair<std::vector<std::shared_ptr<JTaskBase>>, JEventSource::RETURN_STATUS> sTasks;
-	sTasks.second = sFailureStatus; //is kSuccess if nothing went wrong
-	for(auto& sEvent : sEvents)
-		sTasks.first.push_back(GetProcessEventTask(std::move(sEvent)));
+	std::vector<std::shared_ptr<JTaskBase> > sTasks;
+	mEventsRead.fetch_add(sEvents.size());
+	for(auto& sEvent : sEvents) sTasks.push_back(GetProcessEventTask(std::move(sEvent)));
+	mTasksCreated.fetch_add(sTasks.size());
 
-	//If the file is empty, note it
-	if(sFailureStatus == RETURN_STATUS::kNO_MORE_EVENTS)
-		mFileClosed = true;
 
 	//Return the tasks
 	return sTasks;
@@ -151,11 +213,11 @@ std::shared_ptr<JTaskBase> JEventSource::GetProcessEventTask(std::shared_ptr<con
 }
 
 //---------------------------------
-// IsDone
+// IsExhausted
 //---------------------------------
-bool JEventSource::IsFileClosed(void) const
+bool JEventSource::IsExhausted(void) const
 {
-	return mFileClosed;
+	return mExhausted;
 }
 
 

@@ -47,9 +47,9 @@
 #include "JThreadManager.h"
 #include "JEventSource.h"
 #include "JApplication.h"
-#include "JQueueInterface.h"
+#include "JQueue.h"
 #include "JQueueSet.h"
-#include "JLog.h"
+#include "JLogger.h"
 
 
 thread_local JThread *JTHREAD = nullptr;
@@ -62,16 +62,20 @@ JThread::JThread(int aThreadID, JApplication* aApplication, JThreadManager::JEve
 		mEventQueue(mEventSourceInfo->mQueueSet->GetQueue(JQueueSet::JQueueType::Events)), mRotateEventSources(aRotateEventSources),
 		mThreadID(aThreadID)
 {
-	//Apparently segfaults
-	/*
-	gPARMS->SetDefaultParameter("JANA:THREAD_DEBUG_LEVEL", mDebugLevel, "JThread(Manager) debug level");
+	aApplication->GetJParameterManager()->SetDefaultParameter(
+		"JANA:THREAD_DEBUG_LEVEL", 
+		mDebugLevel, 
+		"JThread(Manager) debug level");
 
 	auto sSleepTimeNanoseconds = mSleepTime.count();
-	gPARMS->SetDefaultParameter("JANA:THREAD_SLEEP_TIME_NS", sSleepTimeNanoseconds, "Thread sleep time (in nanoseconds) when nothing to do.");
+	aApplication->GetJParameterManager()->SetDefaultParameter(
+		"JANA:THREAD_SLEEP_TIME_NS", 
+		sSleepTimeNanoseconds, 
+		"Thread sleep time (in nanoseconds) when nothing to do.");
+
 	if(sSleepTimeNanoseconds != mSleepTime.count())
 		mSleepTime = std::chrono::nanoseconds(sSleepTimeNanoseconds);
-*/
-//	mDebugLevel = 500;
+
 	_thread = new std::thread( &JThread::Loop, this );
 }
 
@@ -80,6 +84,7 @@ JThread::JThread(int aThreadID, JApplication* aApplication, JThreadManager::JEve
 //---------------------------------
 JThread::~JThread()
 {
+	if( mLogger ) delete mLogger;
 //extern void WriteBuff(void);
 //WriteBuff();
 }
@@ -148,12 +153,13 @@ void JThread::Join(void)
 	/// state then this will call End() and wait for it to do so
 	/// before calling join. This should generally only be called 
 	/// from a method JThreadManager.
-	if(_isjoined)
-		return;
+	if(_isjoined) return;
 	if( mRunStateTarget != kRUN_STATE_ENDED ) End();
 	while( mRunState != kRUN_STATE_ENDED ) std::this_thread::sleep_for( std::chrono::microseconds(100) );
 	_thread->join();
 	_isjoined = true;
+	delete _thread;
+	_thread = nullptr;
 }
 
 //---------------------------------
@@ -192,10 +198,27 @@ bool JThread::IsIdle(void)
 }
 
 //---------------------------------
+// IsRunning
+//---------------------------------
+bool JThread::IsRunning(void)
+{
+	/// Return true if the thread is currently in the running state.
+	/// Being in the running state means the thread is currently
+	/// able to process tasks. The thread may not be actively processing
+	/// a task at the moment (e.g. stuck waiting for a task due to
+	/// being an I/O bound job.)
+	
+	return mRunState == kRUN_STATE_RUNNING;
+}
+
+//---------------------------------
 // IsEnded
 //---------------------------------
 bool JThread::IsEnded(void)
 {
+	/// Return true if the thread is in the ended state and will not
+	/// process any more events. The thread will only enter this state
+	/// when exiting the Loop method.
 	return mRunState == kRUN_STATE_ENDED;
 }
 
@@ -240,8 +263,7 @@ void JThread::Loop(void)
 			}
 
 			// Grab the next task
-			if(mDebugLevel >= 50)
-				*mLogger << "Thread " << mThreadID << " JThread::Loop(): Grab task\n" << JLogEnd();
+			if(mDebugLevel >= 50) *mLogger << "Thread " << mThreadID << " JThread::Loop(): Grab task\n" << JLogEnd();
 			auto sQueueType = JQueueSet::JQueueType::Events;
 			auto sTask = std::shared_ptr<JTaskBase>(nullptr);
 			std::tie(sQueueType, sTask) = mEventSourceInfo->mQueueSet->GetTask();
@@ -251,8 +273,7 @@ void JThread::Loop(void)
 			//Do we have a task?
 			if(sTask == nullptr)
 			{
-				if(!HandleNullTask())
-					break; //No more tasks, end the loop
+				if(!HandleNullTask()) break; //No more tasks, end the loop
 				continue;
 			}
 
@@ -331,13 +352,10 @@ bool JThread::CheckEventQueue(void)
 		*mLogger << "Thread " << mThreadID << " JThread::CheckEventQueue(): Get " << sNumEventsToGet << " process event tasks\n" << JLogEnd();
 
 	//Get the next event(s) from the source, and get task(s) to process it/them (unless another thread has locked access)
-	auto sTasksPair = mEventSourceInfo->mEventSource->GetProcessEventTasks(sNumEventsToGet);
-	auto sReturnStatus = sTasksPair.second;
-	auto& sEventTasks = sTasksPair.first;
-
-	//Check if successful. If so, add tasks to queue
-	if(sReturnStatus == JEventSource::RETURN_STATUS::kSUCCESS)
-	{
+//	auto sTasksPair = mEventSourceInfo->mEventSource->GetProcessEventTasks(sNumEventsToGet);
+//	auto sReturnStatus = sTasksPair.second;
+	auto sEventTasks = mEventSourceInfo->mEventSource->GetProcessEventTasks(sNumEventsToGet);
+	if( !sEventTasks.empty() ){
 		if(mDebugLevel >= 40)
 			*mLogger << "Thread " << mThreadID << " JThread::CheckEventQueue(): Success, add task(s)\n" << JLogEnd();
 
@@ -347,40 +365,33 @@ bool JThread::CheckEventQueue(void)
 			//Add this process-event task to the event queue.
 			//We have no where else to put this task if it doesn't fit in the queue.
 			//So just continually try to add it
-			if(mEventQueue->AddTask(std::move(sEventTask)) != JQueueInterface::Flags_t::kNO_ERROR)
+			if(mEventQueue->AddTask(std::move(sEventTask)) != JQueue::Flags_t::kNO_ERROR)
 			{
 				//Add failed, queue must be full.
 				//This (probably) shouldn't happen if the relationship between the
 				//queue size and the buffer size is reasonable.
+				
+				if(mDebugLevel >= 40) *mLogger << "Thread " << mThreadID << " JThread::CheckEventQueue(): Unable to add task, executing... \n" << JLogEnd();
 
 				//Oh well. Just execute this task directly instead
 				//This is faster than pulling an event off the front of the queue
 				(*sEventTask)();
+				mEventQueue->AddTasksProcessedOutsideQueue(1);
 			}
 		}
 
-		//Process-event task is submitted
+		//Process-event task(s) submitted
 		return true;
 	}
-	else if(sReturnStatus == JEventSource::RETURN_STATUS::kNO_MORE_EVENTS)
-	{
-		if(mDebugLevel >= 10)
-			*mLogger << "Thread " << mThreadID << " JThread::CheckEventQueue(): No more events\n" << JLogEnd();
 
-		//The source has been emptied.
-		//Continue processing jobs from this source until there aren't any more
-		mSourceEmpty = true;
-		return false;
-	}
-	else if(sReturnStatus == JEventSource::RETURN_STATUS::kTRY_AGAIN)
-	{
-		if(mDebugLevel >= 10)
-			*mLogger << "Thread " << mThreadID << " JThread::CheckEventQueue(): Try again later\n" << JLogEnd();
-		return false;
-	}
+	if(mDebugLevel >= 40) *mLogger << "Thread " << mThreadID << " JThread::CheckEventQueue(): No task(s) added\n" << JLogEnd();
 
-	//Else: Another thread has exclusive access to this event source
-	//In this case, try to execute other jobs for this source (if none, will rotate-sources/sleep after check
+	// No event tasks were read from the source
+	if( mEventSourceInfo->mEventSource->IsExhausted() ) mSourceEmpty = true;
+	
+	// We may get here for a variety of reasons. All of them though indicate
+	// that no events were obtained so return false to let the caller know that
+	// nothing was added to any queues.
 	return false;
 }
 
@@ -490,5 +501,7 @@ void JThread::Stop(bool wait_until_idle)
 	// That should only be for the duration of processing of the current
 	// event though and this method is expected to be used rarely so
 	// this should be OK.
-	if( wait_until_idle ) while( mRunState == kRUN_STATE_RUNNING ) std::this_thread::yield();
+	if( wait_until_idle ){
+		while( (mRunState==kRUN_STATE_RUNNING) && (mRunStateTarget==kRUN_STATE_IDLE) ) std::this_thread::yield();
+	}
 }

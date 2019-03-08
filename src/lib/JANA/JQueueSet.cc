@@ -43,7 +43,7 @@
 //- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
 #include "JQueueSet.h"
-#include "JLog.h"
+#include "JLogger.h"
 
 #include <algorithm>
 
@@ -76,7 +76,7 @@ std::size_t JQueueSet::GetNumQueues(void) const
 //---------------------------------
 // SetQueues
 //---------------------------------
-void JQueueSet::SetQueues(JQueueSet::JQueueType aQueueType, const std::vector<JQueueInterface*>& aQueues)
+void JQueueSet::SetQueues(JQueueSet::JQueueType aQueueType, const std::vector<JQueue*>& aQueues)
 {
 	mQueues.emplace(aQueueType, aQueues);
 }
@@ -84,9 +84,14 @@ void JQueueSet::SetQueues(JQueueSet::JQueueType aQueueType, const std::vector<JQ
 //---------------------------------
 // AddQueue
 //---------------------------------
-void JQueueSet::AddQueue(JQueueSet::JQueueType aQueueType, JQueueInterface* aQueue)
+void JQueueSet::AddQueue(JQueueSet::JQueueType aQueueType, JQueue* aQueue, bool aAddToFront)
 {
-	mQueues[aQueueType].push_back(aQueue);
+	auto &v = mQueues[aQueueType];
+	if( aAddToFront ){
+		v.insert(v.begin(), aQueue);
+	}else{
+		v.push_back(aQueue);
+	}
 }
 
 //---------------------------------
@@ -149,7 +154,7 @@ void JQueueSet::FinishedWithQueues(void)
 //---------------------------------
 // GetQueues
 //---------------------------------
-void JQueueSet::GetQueues(std::map<JQueueSet::JQueueType, std::vector<JQueueInterface*>>& aQueues) const
+void JQueueSet::GetQueues(std::map<JQueueSet::JQueueType, std::vector<JQueue*>>& aQueues) const
 {
 	aQueues = mQueues;
 }
@@ -157,7 +162,7 @@ void JQueueSet::GetQueues(std::map<JQueueSet::JQueueType, std::vector<JQueueInte
 //---------------------------------
 // GetQueue
 //---------------------------------
-JQueueInterface* JQueueSet::GetQueue(JQueueSet::JQueueType aQueueType, const std::string& aName) const
+JQueue* JQueueSet::GetQueue(JQueueSet::JQueueType aQueueType, const std::string& aName) const
 {
 	//Check if any queues of the desired type
 	auto sMapIterator = mQueues.find(aQueueType);
@@ -170,7 +175,7 @@ JQueueInterface* JQueueSet::GetQueue(JQueueSet::JQueueType aQueueType, const std
 		return sQueues[0];
 
 	//Try to find the queue with the given name
-	auto sFindQueue = [aName](const JQueueInterface* aQueue) -> bool { return (aQueue->GetName() == aName); };
+	auto sFindQueue = [aName](const JQueue* aQueue) -> bool { return (aQueue->GetName() == aName); };
 
 	auto sEnd = std::end(sQueues);
 	auto sVectorIterator = std::find_if(std::begin(sQueues), sEnd, sFindQueue);
@@ -193,8 +198,10 @@ std::pair<JQueueSet::JQueueType, std::shared_ptr<JTaskBase>> JQueueSet::GetTask(
 		{
 			//Get task if any
 			auto sTask = sQueue->GetTask();
-			if(sTask != nullptr)
+			if(sTask != nullptr){
+//std::cout << "Grabbed task from queue: " << sQueue->GetName() << std::endl;
 				return std::make_pair(sQueueType, std::move(sTask));
+			}
 		}
 	}
 
