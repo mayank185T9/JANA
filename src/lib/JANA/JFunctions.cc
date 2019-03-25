@@ -1,5 +1,5 @@
 
-#include "JFunctions.h"
+//#include "JFunctions.h"
 #include "JEvent.h"
 #include "JTask.h"
 #include "JApplication.h"
@@ -18,7 +18,8 @@ std::shared_ptr<JTaskBase> JMakeAnalyzeEventTask(std::shared_ptr<const JEvent>&&
 		
 			// Make sure Init function is called for this processor, but only once.
 			std::call_once(sProcessor->init_flag, &JEventProcessor::Init, sProcessor);
-		
+
+			// Do not catch exceptions here. Allow them to propagate up to caller
 			sProcessor->Process(aEvent);
 		}
 	};
